@@ -1,0 +1,22 @@
+[package]
+name = "weaver-relay-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+bytes.workspace = true
+getrandom.workspace = true
+iroh.workspace = true
+thiserror.workspace = true
+weaver-config = { path = "../weaver-config" }
+weaver-core = { path = "../weaver-core" }
+weaver-crypto = { path = "../weaver-crypto" }
+weaver-store = { path = "../weaver-store" }
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

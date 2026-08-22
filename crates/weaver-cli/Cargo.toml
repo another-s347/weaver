@@ -1,0 +1,20 @@
+[package]
+name = "weaver-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+weaver-config = { path = "../weaver-config" }
+weaver-core = { path = "../weaver-core" }
+weaver-crypto = { path = "../weaver-crypto" }
+weaver-net = { path = "../weaver-net" }
+weaver-relay-core = { path = "../weaver-relay-core" }
+weaver-store = { path = "../weaver-store" }
+zeroize.workspace = true

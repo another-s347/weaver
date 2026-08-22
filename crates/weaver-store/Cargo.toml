@@ -1,0 +1,22 @@
+[package]
+name = "weaver-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+aes-gcm.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+redb.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+weaver-core = { path = "../weaver-core" }
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

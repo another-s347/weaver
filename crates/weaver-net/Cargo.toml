@@ -1,0 +1,31 @@
+[package]
+name = "weaver-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+iroh.workspace = true
+iroh-relay.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+weaver-core = { path = "../weaver-core" }
+weaver-config = { path = "../weaver-config" }
+weaver-crypto = { path = "../weaver-crypto" }
+weaver-discovery = { path = "../weaver-discovery" }
+weaver-relay-core = { path = "../weaver-relay-core" }
+weaver-store = { path = "../weaver-store" }
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
