@@ -15,9 +15,9 @@ use weaver_config::{
     AdminKey, ChainExpectation, ConfigHead, ConfigUpdateBatch, EncryptedConfigEnvelope,
     EpochSecrets, MemberEncryptionKeypair, NetworkConfigV1, NetworkPolicy,
     PresenceServiceDescriptor, RelayDescriptor, RelayRoles, ValidatedNetworkConfig,
+    VirtualDnsRecord,
 };
-use weaver_core::MemberId;
-use weaver_core::NetworkId;
+use weaver_core::{AppAddr, MemberId, NetworkId, VirtualName};
 use weaver_crypto::{
     AdminCertificate, AppBinding, AppRegistration, AppRegistrationRequest, EndpointBinding,
     JoinRequest, JoinRequestPayload, MemberCertificate, MemberRoles, NetworkRootKey,
@@ -809,6 +809,58 @@ impl Authority {
         self.commit_config(next, now_ms).await
     }
 
+    /// Adds or atomically updates a network-scoped virtual DNS record.
+    ///
+    /// Names and application addresses live in the signed configuration chain, so every
+    /// member resolves the same mapping after normal configuration anti-entropy converges.
+    pub async fn set_virtual_dns(
+        &mut self,
+        name: VirtualName,
+        app_addr: AppAddr,
+        expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<AuthorityStatus, AuthorityError> {
+        let config = self.config.as_config();
+        let app_exists = config.apps.iter().any(|raw| {
+            AppRegistration::from_bytes(raw)
+                .map(|app| app.payload().app_addr == app_addr)
+                .unwrap_or(false)
+        });
+        if !app_exists {
+            return Err(AuthorityError::ApplicationNotFound);
+        }
+        if expires_at_ms <= now_ms || expires_at_ms > config.expires_at_ms {
+            return Err(AuthorityError::InvalidOptions);
+        }
+
+        let mut next = config.clone();
+        next.virtual_dns.retain(|record| record.name != name);
+        next.virtual_dns.push(VirtualDnsRecord {
+            name,
+            app_addr,
+            expires_at_ms,
+        });
+        next.virtual_dns
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        prepare_next_revision(&mut next, self.status.head, now_ms)?;
+        self.commit_config(next, now_ms).await
+    }
+
+    pub async fn remove_virtual_dns(
+        &mut self,
+        name: &VirtualName,
+        now_ms: u64,
+    ) -> Result<AuthorityStatus, AuthorityError> {
+        let mut next = self.config.as_config().clone();
+        let before = next.virtual_dns.len();
+        next.virtual_dns.retain(|record| &record.name != name);
+        if next.virtual_dns.len() == before {
+            return Err(AuthorityError::VirtualDnsRecordNotFound);
+        }
+        prepare_next_revision(&mut next, self.status.head, now_ms)?;
+        self.commit_config(next, now_ms).await
+    }
+
     /// Adds or atomically updates an infrastructure endpoint already authorized as a
     /// relay/bootstrap member. Re-registering the same endpoint is the URL/role rotation
     /// transaction; rotating its key uses invite(new) -> register(new) -> remove(old).
@@ -923,6 +975,10 @@ pub enum AuthorityError {
     CannotRevokeAuthorityMember,
     #[error("application is already registered in this network")]
     ApplicationAlreadyRegistered,
+    #[error("application does not exist in the current network configuration")]
+    ApplicationNotFound,
+    #[error("virtual DNS record does not exist in the current network configuration")]
+    VirtualDnsRecordNotFound,
     #[error("relay endpoint does not exist in the current configuration")]
     RelayNotFound,
     #[error("the requested configuration head is not part of this authority chain")]
@@ -1008,6 +1064,7 @@ async fn initialize_staging(
         revoked_serials: Vec::new(),
         apps: Vec::new(),
         app_bindings: Vec::new(),
+        virtual_dns: Vec::new(),
         relays: vec![RelayDescriptor {
             endpoint_id: *endpoint.public().as_bytes(),
             url: options.relay_url.clone(),
@@ -1763,5 +1820,39 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        let name = VirtualName::new("weaver.virtual").unwrap();
+        assert!(matches!(
+            authority
+                .set_virtual_dns(
+                    VirtualName::new("missing.virtual").unwrap(),
+                    AppAddr::from_bytes([0xee; 32]),
+                    20_000,
+                    2_400,
+                )
+                .await,
+            Err(AuthorityError::ApplicationNotFound)
+        ));
+        let named = authority
+            .set_virtual_dns(name.clone(), app_root.app_addr(), 20_000, 2_400)
+            .await
+            .unwrap();
+        assert_eq!(named.head.revision, 3);
+        assert_eq!(
+            authority.config().resolve_virtual_name(&name, 2_500),
+            Some(app_root.app_addr())
+        );
+        let removed = authority.remove_virtual_dns(&name, 2_500).await.unwrap();
+        assert_eq!(removed.head.revision, 4);
+        assert!(
+            authority
+                .config()
+                .resolve_virtual_name(&name, 2_600)
+                .is_none()
+        );
+        assert!(matches!(
+            authority.remove_virtual_dns(&name, 2_600).await,
+            Err(AuthorityError::VirtualDnsRecordNotFound)
+        ));
     }
 }

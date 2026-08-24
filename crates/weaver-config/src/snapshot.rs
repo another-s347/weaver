@@ -3,17 +3,19 @@ use std::fmt;
 
 use bytes::Bytes;
 use thiserror::Error;
-use weaver_core::{AppAddr, MemberId, NetworkId};
+use weaver_core::{AppAddr, MemberId, NetworkId, VirtualName};
 use weaver_crypto::{
     AdminCertificate, AppBinding, AppRegistration, CertificateError, EndpointBinding,
     MemberCertificate, NetworkRootPublic, VerifiedAdmin, VerifiedApp, VerifiedMember,
 };
 use zeroize::Zeroizing;
 
-const SNAPSHOT_MAGIC: &[u8; 8] = b"WVRSNP\0\x01";
+const SNAPSHOT_MAGIC_V1: &[u8; 8] = b"WVRSNP\0\x01";
+const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"WVRSNP\0\x02";
 const MAX_MEMBERS: usize = 256;
 const MAX_APPS: usize = 256;
 const MAX_BINDINGS: usize = 1024;
+const MAX_VIRTUAL_DNS_RECORDS: usize = 1024;
 const MAX_RELAYS: usize = 64;
 const MAX_PRESENCE_SERVICES: usize = 64;
 const MAX_ADMIN_KEYS: usize = 16;
@@ -63,6 +65,13 @@ pub struct RelayDescriptor {
 pub struct PresenceServiceDescriptor {
     pub endpoint_id: [u8; 32],
     pub url: String,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VirtualDnsRecord {
+    pub name: VirtualName,
+    pub app_addr: AppAddr,
     pub expires_at_ms: u64,
 }
 
@@ -138,6 +147,7 @@ pub struct NetworkConfigV1 {
     pub revoked_serials: Vec<u64>,
     pub apps: Vec<Bytes>,
     pub app_bindings: Vec<Bytes>,
+    pub virtual_dns: Vec<VirtualDnsRecord>,
     pub relays: Vec<RelayDescriptor>,
     pub presence_services: Vec<PresenceServiceDescriptor>,
     pub epoch_secrets: EpochSecrets,
@@ -148,7 +158,7 @@ impl NetworkConfigV1 {
     pub fn to_bytes(&self) -> Result<Bytes, SnapshotError> {
         self.validate_shape()?;
         let mut out = Vec::new();
-        out.extend_from_slice(SNAPSHOT_MAGIC);
+        out.extend_from_slice(SNAPSHOT_MAGIC_V2);
         out.extend_from_slice(self.network_id.as_bytes());
         push_u64(&mut out, self.epoch);
         push_u64(&mut out, self.revision);
@@ -168,6 +178,12 @@ impl NetworkConfigV1 {
         }
         push_blobs(&mut out, &self.apps)?;
         push_blobs(&mut out, &self.app_bindings)?;
+        push_count(&mut out, self.virtual_dns.len())?;
+        for record in &self.virtual_dns {
+            push_string(&mut out, record.name.as_str())?;
+            out.extend_from_slice(record.app_addr.as_bytes());
+            push_u64(&mut out, record.expires_at_ms);
+        }
         push_count(&mut out, self.relays.len())?;
         for relay in &self.relays {
             out.extend_from_slice(&relay.endpoint_id);
@@ -192,7 +208,15 @@ impl NetworkConfigV1 {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SnapshotError> {
         let mut decoder = Decoder::new(bytes);
-        decoder.magic(SNAPSHOT_MAGIC)?;
+        let has_virtual_dns = if bytes.starts_with(SNAPSHOT_MAGIC_V2) {
+            decoder.magic(SNAPSHOT_MAGIC_V2)?;
+            true
+        } else if bytes.starts_with(SNAPSHOT_MAGIC_V1) {
+            decoder.magic(SNAPSHOT_MAGIC_V1)?;
+            false
+        } else {
+            return Err(SnapshotError::MalformedWire);
+        };
         let network_id = NetworkId::from_bytes(decoder.array()?);
         let epoch = decoder.u64()?;
         let revision = decoder.u64()?;
@@ -215,6 +239,21 @@ impl NetworkConfigV1 {
         }
         let apps = decoder.blobs(MAX_APPS)?;
         let app_bindings = decoder.blobs(MAX_BINDINGS)?;
+        let virtual_dns = if has_virtual_dns {
+            let virtual_dns_count = decoder.count(MAX_VIRTUAL_DNS_RECORDS)?;
+            let mut records = Vec::with_capacity(virtual_dns_count);
+            for _ in 0..virtual_dns_count {
+                records.push(VirtualDnsRecord {
+                    name: VirtualName::new(decoder.string()?)
+                        .map_err(|_| SnapshotError::InvalidVirtualName)?,
+                    app_addr: AppAddr::from_bytes(decoder.array()?),
+                    expires_at_ms: decoder.u64()?,
+                });
+            }
+            records
+        } else {
+            Vec::new()
+        };
         let relay_count = decoder.count(MAX_RELAYS)?;
         let mut relays = Vec::with_capacity(relay_count);
         for _ in 0..relay_count {
@@ -259,6 +298,7 @@ impl NetworkConfigV1 {
             revoked_serials,
             apps,
             app_bindings,
+            virtual_dns,
             relays,
             presence_services,
             epoch_secrets,
@@ -362,6 +402,20 @@ impl NetworkConfigV1 {
                 return Err(SnapshotError::DuplicateEntry("application binding"));
             }
         }
+        let mut virtual_names = HashSet::new();
+        for record in &self.virtual_dns {
+            if !apps.contains_key(&record.app_addr) {
+                return Err(SnapshotError::UnknownApplication);
+            }
+            if record.expires_at_ms <= self.issued_at_ms
+                || record.expires_at_ms > self.expires_at_ms
+            {
+                return Err(SnapshotError::InvalidValidityWindow);
+            }
+            if !virtual_names.insert(record.name.clone()) {
+                return Err(SnapshotError::DuplicateEntry("virtual DNS name"));
+            }
+        }
         validate_descriptors(&self.relays, &self.presence_services, now_ms)?;
         Ok(ValidatedNetworkConfig { inner: self })
     }
@@ -376,6 +430,7 @@ impl NetworkConfigV1 {
         check_len(self.revoked_serials.len(), MAX_REVOKED_SERIALS)?;
         check_len(self.apps.len(), MAX_APPS)?;
         check_len(self.app_bindings.len(), MAX_BINDINGS)?;
+        check_len(self.virtual_dns.len(), MAX_VIRTUAL_DNS_RECORDS)?;
         check_len(self.relays.len(), MAX_RELAYS)?;
         check_len(self.presence_services.len(), MAX_PRESENCE_SERVICES)?;
         for raw in self
@@ -414,6 +469,14 @@ impl ValidatedNetworkConfig {
 
     pub fn into_config(self) -> NetworkConfigV1 {
         self.inner
+    }
+
+    pub fn resolve_virtual_name(&self, name: &VirtualName, now_ms: u64) -> Option<AppAddr> {
+        self.inner
+            .virtual_dns
+            .iter()
+            .find(|record| &record.name == name && record.expires_at_ms > now_ms)
+            .map(|record| record.app_addr)
     }
 
     pub fn verified_admin(
@@ -457,6 +520,8 @@ pub enum SnapshotError {
     UnknownMember,
     #[error("configuration references an unknown application")]
     UnknownApplication,
+    #[error("configuration contains an invalid virtual DNS name")]
+    InvalidVirtualName,
     #[error("configuration references an unknown online administrator")]
     UnknownAdmin,
     #[error("configuration violates its declared policy limits")]
@@ -708,6 +773,11 @@ mod tests {
                 revoked_serials: Vec::new(),
                 apps: vec![app.to_bytes()],
                 app_bindings: vec![app_binding.to_bytes()],
+                virtual_dns: vec![VirtualDnsRecord {
+                    name: VirtualName::new("weaver.virtual").unwrap(),
+                    app_addr: app_root.app_addr(),
+                    expires_at_ms: 7_000,
+                }],
                 relays: vec![RelayDescriptor {
                     endpoint_id: [0x61; 32],
                     url: "https://relay.example.test".to_owned(),
@@ -740,6 +810,34 @@ mod tests {
             .unwrap();
         assert_eq!(validated.as_config().revision, 9);
         assert_eq!(validated.as_config().relays.len(), 1);
+        let name = VirtualName::new("weaver.virtual").unwrap();
+        assert_eq!(
+            validated.resolve_virtual_name(&name, 500),
+            Some(fixture.config.virtual_dns[0].app_addr)
+        );
+        assert_eq!(validated.resolve_virtual_name(&name, 7_000), None);
+    }
+
+    #[test]
+    fn legacy_v1_snapshot_opens_with_an_empty_virtual_dns_zone() {
+        let mut fixture = fixture();
+        fixture.config.virtual_dns.clear();
+        let mut encoded = fixture.config.to_bytes().unwrap().to_vec();
+        let relay_endpoint = [0x61_u8; 32];
+        let endpoint_offset = encoded
+            .windows(relay_endpoint.len())
+            .position(|window| window == relay_endpoint)
+            .unwrap();
+        assert_eq!(
+            &encoded[endpoint_offset - 4..endpoint_offset],
+            &[0, 0, 0, 1]
+        );
+        encoded.drain(endpoint_offset - 4..endpoint_offset - 2);
+        encoded[..SNAPSHOT_MAGIC_V1.len()].copy_from_slice(SNAPSHOT_MAGIC_V1);
+
+        let decoded = NetworkConfigV1::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, fixture.config);
+        assert!(decoded.virtual_dns.is_empty());
     }
 
     #[test]
@@ -838,6 +936,34 @@ mod tests {
         let mut policy = fixture.config;
         policy.policies.max_members = 0;
         assert_eq!(policy.to_bytes(), Err(SnapshotError::PolicyLimitExceeded));
+    }
+
+    #[test]
+    fn snapshot_rejects_duplicate_names_and_unknown_dns_targets() {
+        let mut duplicate = fixture();
+        duplicate
+            .config
+            .virtual_dns
+            .push(duplicate.config.virtual_dns[0].clone());
+        assert_eq!(
+            duplicate.config.validate(
+                &duplicate.root.public(),
+                duplicate.root.public().network_id(),
+                500
+            ),
+            Err(SnapshotError::DuplicateEntry("virtual DNS name"))
+        );
+
+        let mut unknown = fixture();
+        unknown.config.virtual_dns[0].app_addr = AppAddr::from_bytes([0xee; 32]);
+        assert_eq!(
+            unknown.config.validate(
+                &unknown.root.public(),
+                unknown.root.public().network_id(),
+                500
+            ),
+            Err(SnapshotError::UnknownApplication)
+        );
     }
 
     #[test]

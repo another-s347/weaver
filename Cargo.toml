@@ -12,6 +12,7 @@ members = [
     "crates/weaver-relay-core",
     "crates/weaver-store",
     "examples/tonic-demo",
+    "examples/http-demo",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
 aes-gcm = "0.10"
 async-stream = "0.3"
 async-trait = "0.1"
@@ -34,6 +36,8 @@ futures-util = "0.3"
 getrandom = "0.4"
 hex = "0.4"
 http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
 iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
@@ -50,6 +54,7 @@ swarm-discovery = "=0.6.3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 tonic = "0.14.2"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"

@@ -4,7 +4,9 @@ use iroh::{EndpointId, SecretKey};
 use thiserror::Error;
 use tokio::{sync::Mutex as AsyncMutex, task::JoinHandle};
 use weaver_config::MemberEncryptionKeypair;
-use weaver_core::{AppAddr, ClientAddr, NetworkId, ScopedVirtualAddr, ServerAddr, VirtualAddr};
+use weaver_core::{
+    AppAddr, ClientAddr, NetworkId, ScopedVirtualAddr, ServerAddr, VirtualAddr, VirtualName,
+};
 use weaver_crypto::{NetworkRootPublic, SigningKeypair};
 use weaver_discovery::{
     DiscoveryError, LanDiscoveryRuntime, MdnsLanDiscovery, PresenceDirectory,
@@ -267,6 +269,24 @@ impl NetworkHandle {
             .await?)
     }
 
+    /// Resolves a signed, network-scoped virtual DNS name without consulting system DNS.
+    pub fn resolve_name(&self, name: &VirtualName) -> Result<ServerAddr, NetworkHandleError> {
+        self.authorizer
+            .config()
+            .resolve_virtual_name(name, wall_now_ms())
+            .map(ServerAddr::new)
+            .ok_or_else(|| NetworkHandleError::UnknownVirtualName(name.clone()))
+    }
+
+    pub async fn connect_tcp_name(
+        &self,
+        name: &VirtualName,
+    ) -> Result<VirtualTcpStream, NetworkHandleError> {
+        let address = self.resolve_name(name)?;
+        self.connect_tcp(VirtualAddr::server(self.network_id, address))
+            .await
+    }
+
     pub async fn connect_udp(
         &self,
         target: VirtualAddr,
@@ -283,6 +303,15 @@ impl NetworkHandle {
                 direct_addresses: Vec::new(),
             })
             .await?)
+    }
+
+    pub async fn connect_udp_name(
+        &self,
+        name: &VirtualName,
+    ) -> Result<VirtualUdpSocket, NetworkHandleError> {
+        let address = self.resolve_name(name)?;
+        self.connect_udp(VirtualAddr::server(self.network_id, address))
+            .await
     }
 
     pub async fn network_change(&self) {
@@ -421,6 +450,8 @@ pub enum NetworkHandleError {
     TargetMustBeServer,
     #[error("requested client address does not match the authorized device binding")]
     ClientAddressMismatch,
+    #[error("virtual DNS name is unknown or expired in this network: {0}")]
+    UnknownVirtualName(VirtualName),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]

@@ -86,6 +86,8 @@ Implemented:
   server address before any application bytes are exposed;
 - `AppAddr` bound into the negotiated ALPN;
 - automated tonic RPC test with direct IP transports disabled, forcing `C -> B -> A`;
+- readable network-local HTTP aliases such as `weaver.virtual`, with HTTP/1.1, HTTP/2,
+  streaming bodies and WebSocket upgrade running over `NetworkHandle` without DNS;
 - an 8 MiB reliable-stream test over the forced relay path using irregular write
   boundaries, exact byte/order verification and a response after client half-close;
 - a live-path test that bootstraps one existing reliable stream through B, observes Iroh
@@ -244,6 +246,23 @@ cargo run -p weaver-tonic-demo --bin client -- call \
   --relay-only \
   --message 'hello through B'
 ```
+
+## HTTP and WebSocket virtual-host demo
+
+`weaver-http-demo` uses readable, network-local aliases instead of putting an IP address or
+the hexadecimal `AppAddr` in an URL. For example:
+
+```text
+http://weaver.virtual/
+http://weaver.virtual/echo
+ws://weaver.virtual/ws
+```
+
+The name is resolved by Weaver's built-in virtual DNS inside the selected `NetworkHandle`; the
+operating-system DNS resolver is never called. Authority-managed records are part of the signed,
+encrypted network configuration and become live through normal config propagation. The name maps
+to an authorized `AppAddr`, while the `AppAddr` remains the cryptographic application identity. See
+[`docs/http-websocket-demo.md`](docs/http-websocket-demo.md) for provisioning and commands.
 
 ## Verification
 

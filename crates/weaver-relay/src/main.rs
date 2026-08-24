@@ -20,7 +20,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use weaver_config::{ConfigHead, ConfigUpdateBatch, RelayRoles};
-use weaver_core::{AppAddr, DeviceId, MemberId, ScopedVirtualAddr};
+use weaver_core::{AppAddr, DeviceId, MemberId, ScopedVirtualAddr, VirtualName};
 use weaver_crypto::{AppBinding, AppRegistrationRequest, MemberRoles, PreparedJoinRequest};
 use weaver_net::{
     ConfigUpdateSource, MemoryOpaquePresenceStore, NetworkAuthorizer, NodeConfig, WeaverEndpoint,
@@ -127,6 +127,10 @@ enum Command {
     AppRegister(AppRegisterArgs),
     /// Commit an application-owner signed server/client binding.
     AppBind(AppBindArgs),
+    /// Add or update a readable name in the network's signed virtual DNS zone.
+    DnsSet(DnsSetArgs),
+    /// Remove a readable name from the network's signed virtual DNS zone.
+    DnsRemove(DnsRemoveArgs),
     /// Register or update an existing relay member in encrypted network topology.
     RelayRegister(RelayRegisterArgs),
     /// Remove a relay endpoint from encrypted network topology.
@@ -245,6 +249,30 @@ struct AppBindArgs {
 }
 
 #[derive(Debug, ClapArgs)]
+struct DnsSetArgs {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    master_key_file: PathBuf,
+    #[arg(long)]
+    name: VirtualName,
+    #[arg(long)]
+    app_addr: AppAddr,
+    #[arg(long, default_value_t = 365)]
+    valid_days: u64,
+}
+
+#[derive(Debug, ClapArgs)]
+struct DnsRemoveArgs {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    master_key_file: PathBuf,
+    #[arg(long)]
+    name: VirtualName,
+}
+
+#[derive(Debug, ClapArgs)]
 struct RelayRegisterArgs {
     #[arg(long)]
     data_dir: PathBuf,
@@ -329,6 +357,8 @@ async fn main() -> Result<()> {
         Some(Command::Revoke(args)) => revoke(args).await,
         Some(Command::AppRegister(args)) => app_register(args).await,
         Some(Command::AppBind(args)) => app_bind(args).await,
+        Some(Command::DnsSet(args)) => dns_set(args).await,
+        Some(Command::DnsRemove(args)) => dns_remove(args).await,
         Some(Command::RelayRegister(args)) => relay_register(args).await,
         Some(Command::RelayRemove(args)) => relay_remove(args).await,
         Some(Command::ExportUpdates(args)) => export_updates(args).await,
@@ -457,6 +487,45 @@ async fn app_bind(args: AppBindArgs) -> Result<()> {
     let status = authority.authorize_app_binding(&binding, now_ms()?).await?;
     println!("revision={}", status.head.revision);
     println!("epoch={}", status.head.epoch);
+    Ok(())
+}
+
+async fn dns_set(args: DnsSetArgs) -> Result<()> {
+    let master_key = read_master_key(&args.master_key_file)?;
+    let mut authority = Authority::open(args.data_dir, *master_key, now_ms()?)
+        .await
+        .context("failed to open Weaver authority")?;
+    let now = now_ms()?;
+    let valid_for_ms = args
+        .valid_days
+        .checked_mul(24 * 60 * 60 * 1_000)
+        .context("--valid-days is too large")?;
+    let expires_at_ms = now
+        .checked_add(valid_for_ms)
+        .context("virtual DNS validity exceeds u64 milliseconds")?;
+    let name = args.name;
+    let app_addr = args.app_addr;
+    let status = authority
+        .set_virtual_dns(name.clone(), app_addr, expires_at_ms, now)
+        .await
+        .context("failed to update virtual DNS")?;
+    println!("name={name}");
+    println!("app_addr={app_addr}");
+    print_status(&status);
+    Ok(())
+}
+
+async fn dns_remove(args: DnsRemoveArgs) -> Result<()> {
+    let master_key = read_master_key(&args.master_key_file)?;
+    let mut authority = Authority::open(args.data_dir, *master_key, now_ms()?)
+        .await
+        .context("failed to open Weaver authority")?;
+    let status = authority
+        .remove_virtual_dns(&args.name, now_ms()?)
+        .await
+        .context("failed to remove virtual DNS record")?;
+    println!("name={}", args.name);
+    print_status(&status);
     Ok(())
 }
 

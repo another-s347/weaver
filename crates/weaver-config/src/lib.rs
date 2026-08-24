@@ -10,7 +10,7 @@ mod snapshot;
 
 pub use snapshot::{
     AdminKey, EpochSecrets, NetworkConfigV1, NetworkPolicy, PresenceServiceDescriptor,
-    RelayDescriptor, RelayRoles, SnapshotError, ValidatedNetworkConfig,
+    RelayDescriptor, RelayRoles, SnapshotError, ValidatedNetworkConfig, VirtualDnsRecord,
 };
 
 use bytes::Bytes;
@@ -1107,6 +1107,7 @@ mod tests {
             revoked_serials: Vec::new(),
             apps: Vec::new(),
             app_bindings: Vec::new(),
+            virtual_dns: Vec::new(),
             relays: Vec::new(),
             presence_services: Vec::new(),
             epoch_secrets: EpochSecrets::from_bytes([[0x81; 32]; 4]),
@@ -1192,6 +1193,7 @@ mod tests {
             revoked_serials: Vec::new(),
             apps: Vec::new(),
             app_bindings: Vec::new(),
+            virtual_dns: Vec::new(),
             relays: Vec::new(),
             presence_services: Vec::new(),
             epoch_secrets: EpochSecrets::from_bytes([[0x91; 32]; 4]),

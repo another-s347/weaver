@@ -2,7 +2,7 @@
 
 use std::{fmt, str::FromStr};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
 /// A stable application address scoped to one virtual network.
@@ -22,6 +22,93 @@ impl AppAddr {
 /// A stable identifier for one isolated virtual network.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NetworkId([u8; 32]);
+
+/// A readable, network-scoped name resolved by Weaver's built-in virtual DNS.
+///
+/// Names are canonical lowercase DNS names under the reserved `.virtual` suffix. They are
+/// never sent to the operating-system DNS resolver.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VirtualName(String);
+
+impl VirtualName {
+    pub fn new(value: impl Into<String>) -> Result<Self, VirtualNameError> {
+        let value = value.into();
+        validate_virtual_name(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for VirtualName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "VirtualName({self})")
+    }
+}
+
+impl fmt::Display for VirtualName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for VirtualName {
+    type Err = VirtualNameError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for VirtualName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for VirtualName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum VirtualNameError {
+    #[error("virtual name must be a lowercase DNS name under the reserved .virtual suffix")]
+    Invalid,
+}
+
+fn validate_virtual_name(value: &str) -> Result<(), VirtualNameError> {
+    if value.is_empty() || value.len() > 253 || !value.is_ascii() {
+        return Err(VirtualNameError::Invalid);
+    }
+    let labels = value.split('.').collect::<Vec<_>>();
+    if labels.len() < 2 || labels.last() != Some(&"virtual") {
+        return Err(VirtualNameError::Invalid);
+    }
+    for label in labels {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(VirtualNameError::Invalid);
+        }
+    }
+    Ok(())
+}
 
 impl NetworkId {
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
@@ -270,5 +357,14 @@ mod tests {
             "00".parse::<DeviceId>(),
             Err(ParseIdError::InvalidEncoding { kind: "DeviceId" })
         ));
+    }
+
+    #[test]
+    fn virtual_names_are_canonical_and_reserved() {
+        let name: VirtualName = "weaver.virtual".parse().unwrap();
+        assert_eq!(name.as_str(), "weaver.virtual");
+        assert!("Weaver.virtual".parse::<VirtualName>().is_err());
+        assert!("weaver.example".parse::<VirtualName>().is_err());
+        assert!("-weaver.virtual".parse::<VirtualName>().is_err());
     }
 }

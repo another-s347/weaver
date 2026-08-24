@@ -1,0 +1,46 @@
+[package]
+name = "weaver-http-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+autobins = false
+
+[[bin]]
+name = "weaver-http-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "weaver-http-client"
+path = "src/bin/client.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "server-auto", "service"] }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+thiserror.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+weaver-core = { path = "../../crates/weaver-core" }
+weaver-crypto = { path = "../../crates/weaver-crypto" }
+weaver-net = { path = "../../crates/weaver-net" }
+weaver-store = { path = "../../crates/weaver-store" }
+zeroize.workspace = true
+
+[dev-dependencies]
+iroh.workspace = true
+iroh-relay.workspace = true
+tempfile.workspace = true
+weaver-config = { path = "../../crates/weaver-config" }
+weaver-relay-core = { path = "../../crates/weaver-relay-core" }

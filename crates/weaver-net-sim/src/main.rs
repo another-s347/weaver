@@ -534,6 +534,7 @@ fn fixture() -> Result<Fixture> {
             client_registration.to_bytes(),
         ],
         app_bindings: vec![server_binding.to_bytes(), client_binding.to_bytes()],
+        virtual_dns: Vec::new(),
         relays: Vec::new(),
         presence_services: Vec::new(),
         epoch_secrets: EpochSecrets::from_bytes([[0x91; 32]; 4]),

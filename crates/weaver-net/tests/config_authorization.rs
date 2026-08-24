@@ -123,6 +123,7 @@ fn signed_config_builds_multi_app_endpoint_authorizations() {
             first_binding.to_bytes(),
             second_binding.to_bytes(),
         ],
+        virtual_dns: Vec::new(),
         relays: Vec::new(),
         presence_services: Vec::new(),
         epoch_secrets: EpochSecrets::from_bytes([[0x71; 32]; 4]),

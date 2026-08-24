@@ -1503,6 +1503,7 @@ mod tests {
             revoked_serials: Vec::new(),
             apps: vec![registration.to_bytes()],
             app_bindings: vec![binding.to_bytes()],
+            virtual_dns: Vec::new(),
             relays: Vec::new(),
             presence_services: Vec::new(),
             epoch_secrets: EpochSecrets::from_bytes(seed),

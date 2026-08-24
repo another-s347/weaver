@@ -57,6 +57,7 @@
 9. Android arm64 是首批编译目标：从第一阶段持续执行 NDK 构建，不要求仓库提供 JNI、Keystore 包装或真机测试。
 10. 虚拟网络只能由独立的 `weaver-relay` 初始化。应用 SDK 不提供 `create` 或网络管理权威，只提供 `prepare_join`、`join`、`open` 和数据面 API。
 11. 存储采用可注入 SPI，并提供官方默认实现：普通持久状态与秘密材料分开；relay 默认使用内置本地数据库，应用可接入自己的数据库和系统密钥库。
+12. 每个网络内置独立 Virtual DNS zone。`*.virtual -> AppAddr` 记录属于加密签名配置，只有 authority 可修改；`NetworkHandle` 本地解析且永不查询系统 DNS，配置传播后现有 connector 自动看到新记录。
 
 ## 2. 总体架构
 

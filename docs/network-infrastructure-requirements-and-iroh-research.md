@@ -186,6 +186,8 @@ weaver://<network-id>/<app-addr>/devices/<device-id>
 - **CFG-8 MUST**：bootstrap ticket 仅暴露首次联系所必需的单节点信息；网络完整拓扑必须等成员认证完成后才能获取。
 - **CFG-9 SHOULD**：ticket 默认一次性、短有效期、绑定新成员公钥并限定角色，且支持在使用前撤销。若无法获得权威一次性消费状态，重复使用同一 ticket 也只能证明同一把成员私钥，不能创建第二个身份。
 - **CFG-10 MUST**：为支持零基础设施加入，ticket/bundle 可以携带候选成员可解密的已签名配置 snapshot/delta。候选连接配置较旧的成员时，可以先提交该权威更新；对端必须验签、校验哈希链并原子应用后再认证新成员。
+- **CFG-11 MUST**：配置包含网络内 Virtual DNS zone，记录至少为规范化 `*.virtual` 名称、目标 `AppAddr` 和有效期；名称在同一配置中必须唯一，目标应用必须已注册，只有 authority 可以提交变更。
+- **CFG-12 MUST**：Virtual DNS 记录随签名配置使用相同的加密、哈希链和 anti-entropy 传播；更新原子生效，过期记录不得继续解析。
 
 ### 4.3 发现与路由
 
@@ -197,6 +199,7 @@ weaver://<network-id>/<app-addr>/devices/<device-id>
 - **DISC-6 MUST**：LAN 公告不得明文广播 `NetworkId`、`AppAddr`、`DeviceId` 或完整拓扑；应使用由当前网络密钥派生并定期轮换的 discovery tag，使同网络成员可识别、非成员不可关联。
 - **DISC-7 SHOULD**：对负缓存、查询超时和多来源冲突给出可观测状态。
 - **DISC-8 MUST**：默认禁用向公共 DNS/Pkarr 发布网络成员和拓扑；如未来启用，只能发布不泄露网络身份的加密或不透明记录。
+- **DISC-9 MUST**：`NetworkHandle` 内置网络作用域名称解析，支持名称连接可靠流和数据报；不得把 `.virtual` 名称交给系统 DNS。未知、过期或另一网络中的同名记录必须在本地失败。
 
 ### 4.4 建连与路径选择
 

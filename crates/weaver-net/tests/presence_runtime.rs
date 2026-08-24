@@ -127,6 +127,7 @@ async fn runtime_discovers_virtual_server_through_opaque_service() -> Result<()>
             )?
             .to_bytes(),
         ],
+        virtual_dns: Vec::new(),
         relays: Vec::new(),
         presence_services: Vec::new(),
         epoch_secrets: EpochSecrets::from_bytes([[0x41; 32], [0x42; 32], [0x43; 32], [0x44; 32]]),
