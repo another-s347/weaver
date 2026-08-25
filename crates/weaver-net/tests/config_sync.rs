@@ -9,11 +9,11 @@ use tokio::sync::Mutex as AsyncMutex;
 use weaver_config::{
     ConfigHead, ConfigUpdateBatch, EncryptedConfigEnvelope, MemberEncryptionKeypair,
 };
-use weaver_core::{AppAddr, DeviceId};
+use weaver_core::AppAddr;
 use weaver_crypto::NetworkRootKey;
 use weaver_net::{
     BoxError, ConfigPeerDescriptor, ConfigSyncEvent, ConfigSyncOptions, ConfigSyncState,
-    ConfigUpdateSource, NetworkError, NodeConfig, WeaverEndpoint,
+    ConfigUpdateSource, LocalBindings, NetworkError, NodeConfig, WeaverEndpoint,
 };
 
 #[derive(Clone)]
@@ -134,12 +134,12 @@ async fn authenticated_member_fetches_exact_encrypted_update_chain() -> Result<(
     });
     let server_key = SecretKey::generate();
     let server_id = server_key.public();
-    let server_config = NodeConfig::client(
+    let server_config = NodeConfig::new(
         server_key,
         None,
         network_id,
-        AppAddr::from_bytes([0x51; 32]),
-        DeviceId::from_bytes([0x52; 32]),
+        LocalBindings::control_plane(),
+        std::iter::empty(),
     )
     .with_config_update_source(source, [client_id]);
     let server = WeaverEndpoint::bind(server_config).await?;
@@ -151,24 +151,24 @@ async fn authenticated_member_fetches_exact_encrypted_update_chain() -> Result<(
         direct_addresses: descriptor.direct_addresses,
     };
 
-    let client = WeaverEndpoint::bind(NodeConfig::client(
+    let client = WeaverEndpoint::bind(NodeConfig::new(
         client_key,
         None,
         network_id,
-        AppAddr::from_bytes([0x61; 32]),
-        DeviceId::from_bytes([0x62; 32]),
+        LocalBindings::control_plane(),
+        std::iter::empty(),
     ))
     .await?;
     let received = client.fetch_config_updates(&target, base_head).await?;
     assert_eq!(received, batch);
     assert_eq!(&*observed.lock().expect("peer log lock"), &[client_id]);
 
-    let outsider = WeaverEndpoint::bind(NodeConfig::client(
+    let outsider = WeaverEndpoint::bind(NodeConfig::new(
         SecretKey::generate(),
         None,
         network_id,
-        AppAddr::from_bytes([0x71; 32]),
-        DeviceId::from_bytes([0x72; 32]),
+        LocalBindings::control_plane(),
+        std::iter::empty(),
     ))
     .await?;
     assert!(matches!(
@@ -218,12 +218,12 @@ async fn background_sync_runs_immediately_and_supports_coalesced_trigger() -> Re
     let client_key = SecretKey::generate();
     let client_id = client_key.public();
     let server = WeaverEndpoint::bind(
-        NodeConfig::client(
+        NodeConfig::new(
             SecretKey::generate(),
             None,
             network_id,
-            AppAddr::from_bytes([0x81; 32]),
-            DeviceId::from_bytes([0x82; 32]),
+            LocalBindings::control_plane(),
+            std::iter::empty(),
         )
         .with_config_update_source(
             Arc::new(AdvancingSource {
@@ -241,12 +241,12 @@ async fn background_sync_runs_immediately_and_supports_coalesced_trigger() -> Re
         relay_url: None,
         direct_addresses: descriptor.direct_addresses,
     };
-    let client = WeaverEndpoint::bind(NodeConfig::client(
+    let client = WeaverEndpoint::bind(NodeConfig::new(
         client_key,
         None,
         network_id,
-        AppAddr::from_bytes([0x91; 32]),
-        DeviceId::from_bytes([0x92; 32]),
+        LocalBindings::control_plane(),
+        std::iter::empty(),
     ))
     .await?;
     let state = Arc::new(AsyncMutex::new(FakeConfigState {

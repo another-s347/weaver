@@ -418,12 +418,12 @@ async fn sync(args: SyncArgs) -> Result<()> {
         .try_into()
         .context("stored endpoint key is corrupt")?;
     let endpoint_secret = EndpointSecretKey::from_bytes(&endpoint_bytes);
-    let endpoint = WeaverEndpoint::bind(NodeConfig::client(
+    let endpoint = WeaverEndpoint::bind(NodeConfig::new(
         endpoint_secret,
         Some(relay_url.clone()),
         network_id,
-        AppAddr::from_bytes([0; 32]),
-        weaver_core::DeviceId::from_bytes([0; 32]),
+        weaver_net::LocalBindings::control_plane(),
+        std::iter::empty(),
     ))
     .await?;
     endpoint

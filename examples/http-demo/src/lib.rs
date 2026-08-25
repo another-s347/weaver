@@ -90,6 +90,7 @@ fn virtual_name_from_uri(uri: &Uri) -> Result<VirtualName, VirtualHttpUriError> 
 #[derive(Clone)]
 pub struct WeaverHttpConnector {
     network: Arc<NetworkHandle>,
+    source: weaver_core::ClientAddr,
 }
 
 #[derive(Debug)]
@@ -133,8 +134,8 @@ impl AsyncWrite for WeaverHttpConnection {
 }
 
 impl WeaverHttpConnector {
-    pub fn new(network: Arc<NetworkHandle>) -> Self {
-        Self { network }
+    pub fn new(network: Arc<NetworkHandle>, source: weaver_core::ClientAddr) -> Self {
+        Self { network, source }
     }
 
     pub fn network(&self) -> &Arc<NetworkHandle> {
@@ -145,7 +146,7 @@ impl WeaverHttpConnector {
         let name = virtual_name_from_uri(&uri)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         self.network
-            .connect_tcp_name(&name)
+            .connect_tcp_name(self.source, &name)
             .await
             .map(|stream| TokioIo::new(WeaverHttpConnection(stream)))
             .map_err(io::Error::other)
@@ -181,6 +182,7 @@ pub fn http2_client(connector: WeaverHttpConnector) -> WeaverHttpClient {
 
 pub async fn connect_websocket(
     network: Arc<NetworkHandle>,
+    source: weaver_core::ClientAddr,
     uri: Uri,
 ) -> Result<
     (
@@ -190,7 +192,7 @@ pub async fn connect_websocket(
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let name = virtual_name_from_uri(&uri)?;
-    let stream = network.connect_tcp_name(&name).await?;
+    let stream = network.connect_tcp_name(source, &name).await?;
     let (socket, response) = tokio_tungstenite::client_async(uri.to_string(), stream).await?;
     Ok((socket, response))
 }

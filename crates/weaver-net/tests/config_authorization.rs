@@ -1,10 +1,11 @@
 use iroh::SecretKey;
 use weaver_config::{EpochSecrets, NetworkConfigV1, NetworkPolicy};
+use weaver_core::{ClientAddr, ServerAddr};
 use weaver_crypto::{
     AppBinding, AppRegistration, AppRole, AppRootKey, EndpointBinding, MemberCertificate,
     MemberRoles, NetworkRootKey, SigningKeypair, derive_device_id,
 };
-use weaver_net::{ConfigAuthorizationError, NodeConfig};
+use weaver_net::{ConfigAuthorizationError, LocalBinding, LocalBindings, NodeConfig};
 
 #[test]
 fn signed_config_builds_multi_app_endpoint_authorizations() {
@@ -132,9 +133,12 @@ fn signed_config_builds_multi_app_endpoint_authorizations() {
     .validate(&root.public(), network, now)
     .unwrap();
 
-    let server =
-        NodeConfig::tcp_server_from_config(server_endpoint, &config, server_app.app_addr())
-            .unwrap();
+    let server = NodeConfig::from_config(
+        server_endpoint,
+        &config,
+        LocalBindings::new([LocalBinding::Server(ServerAddr::new(server_app.app_addr()))]).unwrap(),
+    )
+    .unwrap();
     let authorized = server
         .allowed_clients
         .get(&client_endpoint.public())
@@ -153,20 +157,22 @@ fn signed_config_builds_multi_app_endpoint_authorizations() {
         })
     );
 
-    let client =
-        NodeConfig::client_from_config(client_endpoint, &config, first_client_app.app_addr())
-            .unwrap();
-    assert_eq!(
-        client.local_addr,
-        weaver_core::ScopedVirtualAddr::Client {
-            app: first_client_app.app_addr(),
-            device: first_device,
-        }
-    );
+    let client_addr = ClientAddr::new(first_client_app.app_addr(), first_device);
+    let client = NodeConfig::from_config(
+        client_endpoint,
+        &config,
+        LocalBindings::new([LocalBinding::Client(client_addr)]).unwrap(),
+    )
+    .unwrap();
+    assert!(client.local_bindings.contains_client(client_addr));
 
     assert_eq!(
-        NodeConfig::client_from_config(SecretKey::generate(), &config, first_client_app.app_addr())
-            .unwrap_err(),
+        NodeConfig::from_config(
+            SecretKey::generate(),
+            &config,
+            LocalBindings::new([LocalBinding::Client(client_addr)]).unwrap(),
+        )
+        .unwrap_err(),
         ConfigAuthorizationError::LocalEndpointNotMember
     );
 }

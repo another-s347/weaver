@@ -30,6 +30,7 @@
 - 配置传播已形成首个安全闭环：authority 保留每个 revision 的加密 envelope，`ConfigUpdateBatch` 最多携带 1024 个且总计不超过 16 MiB 的连续 revision；成员逐个验证 admin 签名、previous hash、revision、epoch、完整凭据链和 HPKE recipient，再一次性 compare-and-swap envelope/head/signer。任意伪造 base head、跳号、跨网批次、遗漏 history 或并发旧写者均 fail closed。
 - `weaver-relay serve` 在数据中继旁以 authority 自身已签名 EndpointId 启动 network-scoped config-sync ALPN。请求方先由 QUIC/TLS 证明 EndpointId，服务端只允许当前配置中的 endpoint；响应仍是端到端签名和成员 HPKE 加密的 revision chain。真实进程测试已完成 `C(revision 1) -> B relay/config endpoint -> C(revision 2)` 的强制中继同步。
 - `weaver-net` 已提供从 `ValidatedNetworkConfig` 构造 server/client 节点的入口：本地 endpoint 必须存在签名 binding 和对应 app binding，relay 只从已验证配置选择；一个 EndpointId 可以对应多个客户端 `AppAddr + DeviceId`，每条 stream-open 按实际源地址独立授权。开发 demo 仍保留手工 allowlist，等待 join/传播接入。
+- Client binding 证明调用方身份而不是限定目标服务。接收端分别验证本机目标 `Server.app` binding 与远端声明的 `Client { source_app, device }` binding；两者无需相等，因此一个 Client 可以连接网络内多个 Server AppAddr。默认网络成员级允许，后续显式 service ACL 只负责收紧权限。
 - tonic server A 通过 `serve_with_incoming` 接收虚拟流；tonic client C 通过自定义 connector 建立虚拟流。
 - 服务端使用 EndpointId allowlist 且默认拒绝，`AppAddr` 编入 ALPN；iroh QUIC/TLS 提供 A↔C 传输身份和加密。
 - 自动化测试关闭 A/C 的 IP transport，强制 `C -> B -> A` 后完成真实 tonic RPC；另一个原始流测试经中继发送 8 MiB+137 字节、使用不规则写边界并逐字节验证顺序和完整性，同时验证客户端半关闭后仍可读取服务端响应。本机手动测试也已验证允许候选时选择 A↔C IP 直连。
@@ -94,6 +95,22 @@ Application
 ```
 
 硬隔离点位于 `NetworkHandle`：所有向下调用必须携带内部 `NetworkContextId`，而不是依赖调用者传对 `NetworkId`。地址、peer session、listener、datagram 队列和任务都由该 handle 拥有。跨网络对象不能互相转换。
+
+### 2.1 单 Endpoint 多本地 Binding
+
+一个 `NetworkHandle` 对应一个 membership、一个 EndpointId 和一个 iroh endpoint，但可以同时持有多个、且 AppAddr 不同的本地 binding：
+
+```text
+Endpoint / Member
+├─ Server { app: profile_hub_app }
+└─ Client { app: profile_hub_gateway_app, device: D }
+   ├─► Server { app: agent_a }
+   └─► Server { app: agent_b }
+```
+
+公开入口统一为 `NetworkHandle::open(options, bindings)`，不保留单角色构造入口。每个 Server binding 同时注册自己的 TCP/UDP ALPN，并拥有独立 listener 队列；ALPN 协商结果直接决定入站目标，不能依赖发现层猜测。每个出站 TCP/UDP 调用必须显式传入已绑定的 `ClientAddr`，避免多客户端身份时出现隐式选择。
+
+Presence 以 endpoint 为记录和序列号单位，一条加密记录携带该 endpoint 的完整 binding 集合；目录把集合中的每个虚拟地址索引到同一 EndpointId。这样同一 endpoint 的 binding 不会因共享 opaque lookup key 而互相覆盖。
 
 ## 3. Rust workspace 划分
 

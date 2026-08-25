@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use iroh::{RelayUrl, SecretKey};
 use iroh_relay::server::{RelayConfig, Server as RelayServer, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use weaver_core::{AppAddr, DeviceId, NetworkId, ScopedVirtualAddr};
-use weaver_net::{NodeConfig, TransportPathKind, WeaverEndpoint};
+use weaver_core::{AppAddr, ClientAddr, DeviceId, NetworkId, ScopedVirtualAddr, ServerAddr};
+use weaver_net::{LocalBinding, LocalBindings, NodeConfig, TransportPathKind, WeaverEndpoint};
 
 const NETWORK: NetworkId = NetworkId::from_bytes([0x81; 32]);
 const SERVER_APP: AppAddr = AppAddr::from_bytes([0x82; 32]);
@@ -28,11 +28,12 @@ async fn existing_reliable_stream_moves_from_relay_bootstrap_to_direct_path() ->
     .parse()?;
 
     let client_key = SecretKey::generate();
-    let mut server = WeaverEndpoint::bind(NodeConfig::tcp_server(
+    let server_addr = ServerAddr::new(SERVER_APP);
+    let mut server = WeaverEndpoint::bind(NodeConfig::new(
         SecretKey::generate(),
         Some(relay_url.clone()),
         NETWORK,
-        SERVER_APP,
+        LocalBindings::new([LocalBinding::Server(server_addr)])?,
         [(client_key.public(), CLIENT_ADDR)],
     ))
     .await?;
@@ -40,13 +41,14 @@ async fn existing_reliable_stream_moves_from_relay_bootstrap_to_direct_path() ->
     // The descriptor intentionally withholds direct addresses. The first packets can
     // only bootstrap through B; endpoint address exchange may then add an IP path.
     let target = server.descriptor(SERVER_APP).relay_only();
-    let mut listener = server.take_tcp_listener()?;
-    let client = WeaverEndpoint::bind(NodeConfig::client(
+    let mut listener = server.take_tcp_listener(server_addr)?;
+    let source = ClientAddr::new(CLIENT_APP, CLIENT_DEVICE);
+    let client = WeaverEndpoint::bind(NodeConfig::new(
         client_key,
         Some(relay_url),
         NETWORK,
-        CLIENT_APP,
-        CLIENT_DEVICE,
+        LocalBindings::new([LocalBinding::Client(source)])?,
+        std::iter::empty(),
     ))
     .await?;
     client.wait_relay_online(Duration::from_secs(10)).await?;
@@ -65,7 +67,7 @@ async fn existing_reliable_stream_moves_from_relay_bootstrap_to_direct_path() ->
         Ok::<_, std::io::Error>(())
     });
 
-    let mut stream = client.connect(&target).await?;
+    let mut stream = client.connect(source, &target).await?;
     let connection_peer = stream.peer_endpoint_id();
     stream.write_all(b"before-move!").await?;
     let mut ack = [0_u8; 8];

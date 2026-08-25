@@ -33,7 +33,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let root = parse_root(&args.root_public_key)?;
     let options = production_open_options(root, &args.data_dir, read_key(&args.master_key_file)?)?;
-    let mut network = NetworkHandle::open_server(options, ServerAddr::new(args.app_addr)).await?;
+    let server_addr = ServerAddr::new(args.app_addr);
+    let mut network =
+        NetworkHandle::open(options, [weaver_net::LocalBinding::Server(server_addr)]).await?;
     let name = VirtualName::new(args.host.clone())?;
     let resolved = network.resolve_name(&name)?;
     if resolved.app() != args.app_addr {
@@ -44,7 +46,7 @@ async fn main() -> Result<()> {
             args.app_addr
         );
     }
-    let listener = network.take_tcp_listener()?;
+    let listener = network.take_tcp_listener(server_addr)?;
     let server = spawn_http_server(listener, demo_router());
 
     println!("network_id={}", network.network_id());

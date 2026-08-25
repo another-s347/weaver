@@ -71,13 +71,21 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let root = parse_root(&args.root_public_key)?;
     let options = production_open_options(root, &args.data_dir, read_key(&args.master_key_file)?)?;
-    let network = Arc::new(
-        NetworkHandle::open_client(options, ClientAddr::new(args.client_app, args.device_id))
-            .await?,
-    );
+    let source = ClientAddr::new(args.client_app, args.device_id);
+    let network =
+        Arc::new(NetworkHandle::open(options, [weaver_net::LocalBinding::Client(source)]).await?);
     match args.command {
         Command::Get { path, version } => {
-            request(network.clone(), &args.host, path, version, Method::GET, "").await?;
+            request(
+                network.clone(),
+                source,
+                &args.host,
+                path,
+                version,
+                Method::GET,
+                "",
+            )
+            .await?;
         }
         Command::Post {
             path,
@@ -86,6 +94,7 @@ async fn main() -> Result<()> {
         } => {
             request(
                 network.clone(),
+                source,
                 &args.host,
                 path,
                 version,
@@ -96,7 +105,7 @@ async fn main() -> Result<()> {
         }
         Command::Websocket { message } => {
             let uri = virtual_uri("ws", &args.host, "/ws")?;
-            let (mut socket, response) = connect_websocket(network.clone(), uri)
+            let (mut socket, response) = connect_websocket(network.clone(), source, uri)
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             println!("status={}", response.status());
@@ -117,13 +126,14 @@ async fn main() -> Result<()> {
 
 async fn request(
     network: Arc<NetworkHandle>,
+    source: ClientAddr,
     host: &str,
     path: String,
     version: HttpVersion,
     method: Method,
     body: &str,
 ) -> Result<()> {
-    let connector = WeaverHttpConnector::new(network);
+    let connector = WeaverHttpConnector::new(network, source);
     let client = match version {
         HttpVersion::Http1 => http1_client(connector),
         HttpVersion::Http2 => http2_client(connector),

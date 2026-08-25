@@ -4,15 +4,15 @@ use anyhow::{Context, Result};
 use iroh::SecretKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use weaver_config::{EpochSecrets, NetworkConfigV1, NetworkPolicy};
-use weaver_core::{AppAddr, DeviceId, ScopedVirtualAddr};
+use weaver_core::{AppAddr, ClientAddr, DeviceId, ScopedVirtualAddr, ServerAddr};
 use weaver_crypto::{
     AppBinding, AppRegistration, AppRole, AppRootKey, EndpointBinding, MemberCertificate,
     MemberRoles, NetworkRootKey, SigningKeypair,
 };
 use weaver_discovery::{PresenceDirectory, WeaverAddressLookup};
 use weaver_net::{
-    ConfigPeerDescriptor, MemoryOpaquePresenceStore, NodeConfig, PresenceSyncOptions,
-    WeaverEndpoint, spawn_presence_sync,
+    ConfigPeerDescriptor, LocalBinding, LocalBindings, MemoryOpaquePresenceStore, NodeConfig,
+    PresenceSyncOptions, WeaverEndpoint, spawn_presence_sync,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -139,12 +139,12 @@ async fn runtime_discovers_virtual_server_through_opaque_service() -> Result<()>
     let store = Arc::new(MemoryOpaquePresenceStore::new(32));
     let members = [server_transport.public(), client_transport.public()];
     let service = WeaverEndpoint::bind(
-        NodeConfig::client(
+        NodeConfig::new(
             service_transport,
             None,
             network_id,
-            AppAddr::from_bytes([0x99; 32]),
-            DeviceId::from_bytes([0x98; 32]),
+            LocalBindings::control_plane(),
+            std::iter::empty(),
         )
         .with_presence_store(store, members),
     )
@@ -159,11 +159,15 @@ async fn runtime_discovers_virtual_server_through_opaque_service() -> Result<()>
 
     let server_lookup = Arc::new(WeaverAddressLookup::new(network_id));
     let mut server = WeaverEndpoint::bind(
-        NodeConfig::tcp_server_from_config(server_transport, &config, server_app)?
-            .with_address_lookup(server_lookup.clone()),
+        NodeConfig::from_config(
+            server_transport,
+            &config,
+            LocalBindings::new([LocalBinding::Server(ServerAddr::new(server_app))])?,
+        )?
+        .with_address_lookup(server_lookup.clone()),
     )
     .await?;
-    let mut listener = server.take_tcp_listener()?;
+    let mut listener = server.take_tcp_listener(ServerAddr::new(server_app))?;
     let server_directory = Arc::new(PresenceDirectory::new(network_id, server_lookup.clone()));
     let server_runtime = spawn_presence_sync(
         server.dialer(),
@@ -177,8 +181,15 @@ async fn runtime_discovers_virtual_server_through_opaque_service() -> Result<()>
 
     let client_lookup = Arc::new(WeaverAddressLookup::new(network_id));
     let client = WeaverEndpoint::bind(
-        NodeConfig::client_from_config(client_transport, &config, client_app)?
-            .with_address_lookup(client_lookup.clone()),
+        NodeConfig::from_config(
+            client_transport,
+            &config,
+            LocalBindings::new([LocalBinding::Client(ClientAddr::new(
+                client_app,
+                client_device,
+            ))])?,
+        )?
+        .with_address_lookup(client_lookup.clone()),
     )
     .await?;
     let client_directory = Arc::new(PresenceDirectory::new(network_id, client_lookup.clone()));
@@ -207,7 +218,12 @@ async fn runtime_discovers_virtual_server_through_opaque_service() -> Result<()>
     .context("opaque presence did not resolve the virtual server")?;
 
     let mut outgoing = client
-        .connect_virtual(&client_directory, server_app, now_ms())
+        .connect_virtual(
+            ClientAddr::new(client_app, client_device),
+            &client_directory,
+            server_app,
+            now_ms(),
+        )
         .await?;
     let mut incoming = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
     outgoing.write_all(b"virtual-only").await?;

@@ -28,8 +28,7 @@ pub use membership::{
     MembershipStores, NetworkMembership,
 };
 pub use network_handle::{
-    LocalBinding, NetworkHandle, NetworkHandleError, NetworkHandleOpenOptions, VirtualNetwork,
-    member_secret_id,
+    NetworkHandle, NetworkHandleError, NetworkHandleOpenOptions, VirtualNetwork, member_secret_id,
 };
 
 use std::{
@@ -59,7 +58,7 @@ use tokio::{
 use tonic::transport::server::Connected;
 use tracing::{debug, info, warn};
 use weaver_config::{ConfigHead, ConfigUpdateBatch};
-use weaver_core::{AppAddr, DeviceId, NetworkId, ScopedVirtualAddr};
+use weaver_core::{AppAddr, ClientAddr, DeviceId, NetworkId, ScopedVirtualAddr, ServerAddr};
 use weaver_crypto::{AppBinding, AppRole, CertificateError, EndpointBinding, SigningKeypair};
 use weaver_discovery::{
     DiscoveryCandidate, EncryptedPresenceRecord, MAX_PRESENCE_TTL_MS, PresenceDirectory,
@@ -708,7 +707,7 @@ async fn publish_current_presence(
         config,
         signing,
         dialer.endpoint.id(),
-        dialer.local_addr,
+        dialer.local_bindings.iter().collect(),
         candidates.clone(),
         0,
         *sequence,
@@ -1083,6 +1082,81 @@ pub fn tonic_alpn(app_addr: AppAddr) -> Vec<u8> {
     tcp_alpn(app_addr)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LocalBinding {
+    Server(ServerAddr),
+    Client(ClientAddr),
+}
+
+impl LocalBinding {
+    pub fn scoped(self) -> ScopedVirtualAddr {
+        match self {
+            Self::Server(address) => address.scoped(),
+            Self::Client(address) => address.scoped(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalBindings {
+    addresses: HashSet<ScopedVirtualAddr>,
+}
+
+impl LocalBindings {
+    pub fn control_plane() -> Self {
+        Self {
+            addresses: HashSet::new(),
+        }
+    }
+    pub fn new(
+        bindings: impl IntoIterator<Item = LocalBinding>,
+    ) -> Result<Self, LocalBindingsError> {
+        let mut addresses = HashSet::new();
+        for binding in bindings {
+            if !addresses.insert(binding.scoped()) {
+                return Err(LocalBindingsError::Duplicate);
+            }
+        }
+        if addresses.is_empty() {
+            return Err(LocalBindingsError::Empty);
+        }
+        Ok(Self { addresses })
+    }
+
+    pub fn contains(&self, address: ScopedVirtualAddr) -> bool {
+        self.addresses.contains(&address)
+    }
+    pub fn contains_client(&self, address: ClientAddr) -> bool {
+        self.contains(address.scoped())
+    }
+    pub fn contains_server(&self, address: ServerAddr) -> bool {
+        self.contains(address.scoped())
+    }
+    pub fn iter(&self) -> impl Iterator<Item = ScopedVirtualAddr> + '_ {
+        self.addresses.iter().copied()
+    }
+    pub fn servers(&self) -> impl Iterator<Item = ServerAddr> + '_ {
+        self.iter().filter_map(|address| match address {
+            ScopedVirtualAddr::Server { app } => Some(ServerAddr::new(app)),
+            ScopedVirtualAddr::Client { .. } => None,
+        })
+    }
+    pub fn clients(&self) -> impl Iterator<Item = ClientAddr> + '_ {
+        self.iter().filter_map(|address| match address {
+            ScopedVirtualAddr::Client { app, device } => Some(ClientAddr::new(app, device)),
+            ScopedVirtualAddr::Server { .. } => None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum LocalBindingsError {
+    #[error("at least one local binding is required")]
+    Empty,
+    #[error("duplicate local binding")]
+    Duplicate,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerDescriptor {
     pub network_id: NetworkId,
@@ -1160,7 +1234,7 @@ pub struct NodeConfig {
     pub relay_urls: Vec<RelayUrl>,
     pub accept_alpns: Vec<Vec<u8>>,
     pub network_id: NetworkId,
-    pub local_addr: ScopedVirtualAddr,
+    pub local_bindings: LocalBindings,
     pub allowed_clients: HashMap<EndpointId, HashSet<ScopedVirtualAddr>>,
     pub enable_direct_paths: bool,
     pub address_lookup: Option<Arc<WeaverAddressLookup>>,
@@ -1178,7 +1252,7 @@ impl std::fmt::Debug for NodeConfig {
             .field("relay_urls", &self.relay_urls)
             .field("accept_alpns", &self.accept_alpns)
             .field("network_id", &self.network_id)
-            .field("local_addr", &self.local_addr)
+            .field("local_bindings", &self.local_bindings)
             .field("allowed_clients", &self.allowed_clients)
             .field("enable_direct_paths", &self.enable_direct_paths)
             .field("address_lookup", &self.address_lookup.is_some())
@@ -1192,50 +1266,25 @@ impl std::fmt::Debug for NodeConfig {
 }
 
 impl NodeConfig {
-    pub fn client(
+    pub fn new(
         secret_key: SecretKey,
         relay_url: Option<RelayUrl>,
         network_id: NetworkId,
-        app_addr: AppAddr,
-        device_id: DeviceId,
-    ) -> Self {
-        let relay_urls = relay_url.clone().into_iter().collect();
-        Self {
-            secret_key,
-            relay_url,
-            relay_urls,
-            accept_alpns: Vec::new(),
-            network_id,
-            local_addr: ScopedVirtualAddr::Client {
-                app: app_addr,
-                device: device_id,
-            },
-            allowed_clients: HashMap::new(),
-            enable_direct_paths: true,
-            address_lookup: None,
-            config_update_source: None,
-            allowed_config_peers: HashSet::new(),
-            presence_store: None,
-            allowed_presence_peers: HashSet::new(),
-            authorizer: None,
-        }
-    }
-
-    pub fn tcp_server(
-        secret_key: SecretKey,
-        relay_url: Option<RelayUrl>,
-        network_id: NetworkId,
-        app_addr: AppAddr,
+        local_bindings: LocalBindings,
         allowed_clients: impl IntoIterator<Item = (EndpointId, ScopedVirtualAddr)>,
     ) -> Self {
         let relay_urls = relay_url.clone().into_iter().collect();
+        let accept_alpns = local_bindings
+            .servers()
+            .flat_map(|server| [tcp_alpn(server.app()), udp_alpn(server.app())])
+            .collect();
         Self {
             secret_key,
             relay_url,
             relay_urls,
-            accept_alpns: vec![tcp_alpn(app_addr)],
+            accept_alpns,
             network_id,
-            local_addr: ScopedVirtualAddr::Server { app: app_addr },
+            local_bindings,
             allowed_clients: collect_client_authorizations(allowed_clients),
             enable_direct_paths: true,
             address_lookup: None,
@@ -1247,122 +1296,28 @@ impl NodeConfig {
         }
     }
 
-    pub fn tonic_server(
-        secret_key: SecretKey,
-        relay_url: Option<RelayUrl>,
-        network_id: NetworkId,
-        app_addr: AppAddr,
-        allowed_clients: impl IntoIterator<Item = (EndpointId, ScopedVirtualAddr)>,
-    ) -> Self {
-        Self::tcp_server(secret_key, relay_url, network_id, app_addr, allowed_clients)
-    }
-
-    pub fn udp_server(
-        secret_key: SecretKey,
-        relay_url: Option<RelayUrl>,
-        network_id: NetworkId,
-        app_addr: AppAddr,
-        allowed_clients: impl IntoIterator<Item = (EndpointId, ScopedVirtualAddr)>,
-    ) -> Self {
-        let relay_urls = relay_url.clone().into_iter().collect();
-        Self {
-            secret_key,
-            relay_url,
-            relay_urls,
-            accept_alpns: vec![udp_alpn(app_addr)],
-            network_id,
-            local_addr: ScopedVirtualAddr::Server { app: app_addr },
-            allowed_clients: collect_client_authorizations(allowed_clients),
-            enable_direct_paths: true,
-            address_lookup: None,
-            config_update_source: None,
-            allowed_config_peers: HashSet::new(),
-            presence_store: None,
-            allowed_presence_peers: HashSet::new(),
-            authorizer: None,
-        }
-    }
-
-    /// Constructs a server solely from a previously validated network configuration.
-    ///
-    /// The local endpoint must have a signed endpoint binding and a server app binding.
-    /// Every configured client app binding becomes a permitted source address for each
-    /// endpoint bound to that member.
-    pub fn tcp_server_from_config(
+    pub fn from_config(
         secret_key: SecretKey,
         config: &weaver_config::ValidatedNetworkConfig,
-        app_addr: AppAddr,
+        local_bindings: LocalBindings,
     ) -> Result<Self, ConfigAuthorizationError> {
-        let derived = ConfigAuthorizations::derive(config, secret_key.public(), app_addr, None)?;
-        Ok(Self {
-            secret_key,
-            relay_url: derived.relay_urls.first().cloned(),
-            relay_urls: derived.relay_urls,
-            accept_alpns: vec![tcp_alpn(app_addr)],
-            network_id: config.as_config().network_id,
-            local_addr: ScopedVirtualAddr::Server { app: app_addr },
-            allowed_clients: derived.allowed_clients,
-            enable_direct_paths: true,
-            address_lookup: None,
-            config_update_source: None,
-            allowed_config_peers: derived.member_endpoints,
-            presence_store: None,
-            allowed_presence_peers: HashSet::new(),
-            authorizer: None,
-        })
-    }
-
-    pub fn tonic_server_from_config(
-        secret_key: SecretKey,
-        config: &weaver_config::ValidatedNetworkConfig,
-        app_addr: AppAddr,
-    ) -> Result<Self, ConfigAuthorizationError> {
-        Self::tcp_server_from_config(secret_key, config, app_addr)
-    }
-
-    pub fn udp_server_from_config(
-        secret_key: SecretKey,
-        config: &weaver_config::ValidatedNetworkConfig,
-        app_addr: AppAddr,
-    ) -> Result<Self, ConfigAuthorizationError> {
-        let derived = ConfigAuthorizations::derive(config, secret_key.public(), app_addr, None)?;
-        Ok(Self {
-            secret_key,
-            relay_url: derived.relay_urls.first().cloned(),
-            relay_urls: derived.relay_urls,
-            accept_alpns: vec![udp_alpn(app_addr)],
-            network_id: config.as_config().network_id,
-            local_addr: ScopedVirtualAddr::Server { app: app_addr },
-            allowed_clients: derived.allowed_clients,
-            enable_direct_paths: true,
-            address_lookup: None,
-            config_update_source: None,
-            allowed_config_peers: derived.member_endpoints,
-            presence_store: None,
-            allowed_presence_peers: HashSet::new(),
-            authorizer: None,
-        })
-    }
-
-    /// Constructs a client and its network-scoped virtual device address from signed config.
-    pub fn client_from_config(
-        secret_key: SecretKey,
-        config: &weaver_config::ValidatedNetworkConfig,
-        app_addr: AppAddr,
-    ) -> Result<Self, ConfigAuthorizationError> {
-        let derived =
-            ConfigAuthorizations::derive(config, secret_key.public(), app_addr, Some(()))?;
-        let device_id = derived
-            .device_id
-            .ok_or(ConfigAuthorizationError::ClientNotAuthorized)?;
-        let mut node = Self::client(
+        let derived = ConfigAuthorizations::derive(config, secret_key.public(), &local_bindings)?;
+        let mut node = Self::new(
             secret_key,
             derived.relay_urls.first().cloned(),
             config.as_config().network_id,
-            app_addr,
-            device_id,
+            local_bindings,
+            derived
+                .allowed_clients
+                .into_iter()
+                .flat_map(|(endpoint, addresses)| {
+                    addresses
+                        .into_iter()
+                        .map(move |address| (endpoint, address))
+                }),
         );
         node.relay_urls = derived.relay_urls;
+        node.allowed_config_peers = derived.member_endpoints;
         Ok(node)
     }
 
@@ -1523,17 +1478,23 @@ impl NetworkAuthorizer for LiveConfigAuthorizer {
                 return HashSet::new();
             };
             let payload = binding.payload();
-            if payload.app_addr != app || payload.expires_at_ms <= now_ms {
+            if payload.expires_at_ms <= now_ms {
                 continue;
             }
-            if payload.role == AppRole::Server && payload.subject == local_member {
+            if payload.role == AppRole::Server
+                && payload.app_addr == app
+                && payload.subject == local_member
+            {
                 server_authorized = true;
             }
             if payload.role == AppRole::Client
                 && payload.subject == source_member
                 && let Some(device) = payload.device_id
             {
-                clients.insert(ScopedVirtualAddr::Client { app, device });
+                clients.insert(ScopedVirtualAddr::Client {
+                    app: payload.app_addr,
+                    device,
+                });
             }
         }
         if server_authorized {
@@ -1587,7 +1548,6 @@ fn collect_client_authorizations(
 struct ConfigAuthorizations {
     relay_urls: Vec<RelayUrl>,
     allowed_clients: HashMap<EndpointId, HashSet<ScopedVirtualAddr>>,
-    device_id: Option<DeviceId>,
     member_endpoints: HashSet<EndpointId>,
 }
 
@@ -1595,8 +1555,7 @@ impl ConfigAuthorizations {
     fn derive(
         validated: &weaver_config::ValidatedNetworkConfig,
         local_endpoint: EndpointId,
-        local_app: AppAddr,
-        client_mode: Option<()>,
+        local_bindings: &LocalBindings,
     ) -> Result<Self, ConfigAuthorizationError> {
         let config = validated.as_config();
         let mut endpoints_by_member: HashMap<weaver_core::MemberId, Vec<EndpointId>> =
@@ -1616,29 +1575,27 @@ impl ConfigAuthorizations {
         }
         let local_member = local_member.ok_or(ConfigAuthorizationError::LocalEndpointNotMember)?;
         let mut allowed_clients: HashMap<EndpointId, HashSet<ScopedVirtualAddr>> = HashMap::new();
-        let mut server_authorized = false;
-        let mut device_id = None;
+        let mut authorized_local = HashSet::new();
         for raw in &config.app_bindings {
             let binding = AppBinding::from_bytes(raw)?;
             let payload = binding.payload();
             match payload.role {
-                AppRole::Server
-                    if client_mode.is_none()
-                        && payload.subject == local_member
-                        && payload.app_addr == local_app =>
-                {
-                    server_authorized = true;
+                AppRole::Server => {
+                    if payload.subject == local_member {
+                        authorized_local.insert(ScopedVirtualAddr::Server {
+                            app: payload.app_addr,
+                        });
+                    }
                 }
                 AppRole::Client => {
                     let device = payload
                         .device_id
                         .ok_or(ConfigAuthorizationError::ClientNotAuthorized)?;
-                    if client_mode.is_some()
-                        && payload.subject == local_member
-                        && payload.app_addr == local_app
-                        && device_id.replace(device).is_some()
-                    {
-                        return Err(ConfigAuthorizationError::AmbiguousClientBinding);
+                    if payload.subject == local_member {
+                        authorized_local.insert(ScopedVirtualAddr::Client {
+                            app: payload.app_addr,
+                            device,
+                        });
                     }
                     if let Some(endpoints) = endpoints_by_member.get(&payload.subject) {
                         let address = ScopedVirtualAddr::Client {
@@ -1653,14 +1610,19 @@ impl ConfigAuthorizations {
                         }
                     }
                 }
-                AppRole::Server => {}
             }
         }
-        if client_mode.is_none() && !server_authorized {
-            return Err(ConfigAuthorizationError::ServerNotAuthorized);
-        }
-        if client_mode.is_some() && device_id.is_none() {
-            return Err(ConfigAuthorizationError::ClientNotAuthorized);
+        for address in local_bindings.iter() {
+            if !authorized_local.contains(&address) {
+                return Err(match address {
+                    ScopedVirtualAddr::Server { .. } => {
+                        ConfigAuthorizationError::ServerNotAuthorized
+                    }
+                    ScopedVirtualAddr::Client { .. } => {
+                        ConfigAuthorizationError::ClientNotAuthorized
+                    }
+                });
+            }
         }
         let mut relay_urls = config
             .relays
@@ -1674,7 +1636,6 @@ impl ConfigAuthorizations {
         Ok(Self {
             relay_urls,
             allowed_clients,
-            device_id,
             member_endpoints: endpoints_by_member.values().flatten().copied().collect(),
         })
     }
@@ -1698,8 +1659,6 @@ pub enum ConfigAuthorizationError {
     ServerNotAuthorized,
     #[error("local endpoint is not authorized as this application client")]
     ClientNotAuthorized,
-    #[error("multiple client bindings claim the same local application")]
-    AmbiguousClientBinding,
 }
 
 #[derive(Debug, Error)]
@@ -1718,8 +1677,12 @@ pub enum NetworkError {
     OpenRejected(&'static str),
     #[error("virtual TCP protocol violation: {0}")]
     ProtocolViolation(&'static str),
-    #[error("incoming stream receiver was already taken")]
-    IncomingAlreadyTaken,
+    #[error("server address is not bound by this endpoint: {0:?}")]
+    ServerNotBound(ServerAddr),
+    #[error("listener was already taken for server address {0:?}")]
+    ListenerAlreadyTaken(ServerAddr),
+    #[error("client source address is not bound by this endpoint: {0:?}")]
+    ClientNotBound(ClientAddr),
     #[error("configuration sync request was rejected")]
     ConfigSyncRejected,
     #[error("configuration sync payload failed validation: {0}")]
@@ -1734,12 +1697,13 @@ pub enum NetworkError {
 
 pub struct WeaverEndpoint {
     endpoint: Endpoint,
-    incoming: Option<mpsc::Receiver<Result<VirtualTcpStream, io::Error>>>,
-    incoming_datagrams: Option<mpsc::Receiver<Result<VirtualUdpSocket, io::Error>>>,
+    incoming: HashMap<ServerAddr, Option<mpsc::Receiver<Result<VirtualTcpStream, io::Error>>>>,
+    incoming_datagrams:
+        HashMap<ServerAddr, Option<mpsc::Receiver<Result<VirtualUdpSocket, io::Error>>>>,
     accept_task: Option<JoinHandle<()>>,
     relay_url: Option<RelayUrl>,
     network_id: NetworkId,
-    local_addr: ScopedVirtualAddr,
+    local_bindings: LocalBindings,
 }
 
 impl std::fmt::Debug for WeaverEndpoint {
@@ -1747,7 +1711,7 @@ impl std::fmt::Debug for WeaverEndpoint {
         f.debug_struct("WeaverEndpoint")
             .field("endpoint_id", &self.endpoint.id())
             .field("network_id", &self.network_id)
-            .field("local_addr", &self.local_addr)
+            .field("local_bindings", &self.local_bindings)
             .field("relay_url", &self.relay_url)
             .finish_non_exhaustive()
     }
@@ -1759,7 +1723,7 @@ impl WeaverEndpoint {
             || config.config_update_source.is_some()
             || config.presence_store.is_some();
         let network_id = config.network_id;
-        let local_addr = config.local_addr;
+        let local_bindings = config.local_bindings.clone();
         let relay_mode = if config.relay_urls.is_empty() {
             RelayMode::Disabled
         } else {
@@ -1797,14 +1761,26 @@ impl WeaverEndpoint {
             .await
             .map_err(|error| NetworkError::Bind(Box::new(error)))?;
 
-        let (incoming_tx, incoming_rx) = mpsc::channel(64);
-        let (datagram_tx, datagram_rx) = mpsc::channel(64);
+        let mut incoming = HashMap::new();
+        let mut incoming_datagrams = HashMap::new();
+        let mut incoming_txs = HashMap::new();
+        let mut datagram_txs = HashMap::new();
+        let mut application_routes = HashMap::new();
+        for server in local_bindings.servers() {
+            let (tcp_tx, tcp_rx) = mpsc::channel(64);
+            let (udp_tx, udp_rx) = mpsc::channel(64);
+            incoming.insert(server, Some(tcp_rx));
+            incoming_datagrams.insert(server, Some(udp_rx));
+            incoming_txs.insert(server, tcp_tx);
+            datagram_txs.insert(server, udp_tx);
+            application_routes.insert(tcp_alpn(server.app()), (server, false));
+            application_routes.insert(udp_alpn(server.app()), (server, true));
+        }
         let accept_task = if !accepts_connections {
             None
         } else {
             let endpoint = endpoint.clone();
             let network_id = config.network_id;
-            let local_addr = config.local_addr;
             let config_update_source = config.config_update_source;
             let presence_store = config.presence_store;
             let authorizer = config.authorizer.unwrap_or_else(|| {
@@ -1818,22 +1794,23 @@ impl WeaverEndpoint {
                 config_update_source,
                 presence_store,
                 authorizer,
-                incoming_tx,
-                datagram_tx,
+                incoming_txs,
+                datagram_txs,
+                application_routes,
             };
             Some(tokio::spawn(async move {
-                accept_connections(endpoint, network_id, local_addr, services).await;
+                accept_connections(endpoint, network_id, services).await;
             }))
         };
 
         Ok(Self {
             endpoint,
-            incoming: Some(incoming_rx),
-            incoming_datagrams: Some(datagram_rx),
+            incoming,
+            incoming_datagrams,
             accept_task,
             relay_url: config.relay_url,
             network_id,
-            local_addr,
+            local_bindings,
         })
     }
 
@@ -1845,8 +1822,8 @@ impl WeaverEndpoint {
         self.network_id
     }
 
-    pub fn local_addr(&self) -> ScopedVirtualAddr {
-        self.local_addr
+    pub fn local_bindings(&self) -> &LocalBindings {
+        &self.local_bindings
     }
 
     /// Notifies iroh that platform network interfaces changed, triggering path reprobe and
@@ -1876,56 +1853,75 @@ impl WeaverEndpoint {
         }
     }
 
-    /// Takes the sole listener for this endpoint.
+    /// Takes the reliable-stream listener for one bound server address.
     ///
     /// The returned listener implements both an `accept()` API and `Stream`, so it can be
     /// passed directly to `tonic::transport::Server::serve_with_incoming`.
-    pub fn take_tcp_listener(&mut self) -> Result<VirtualTcpListener, NetworkError> {
+    pub fn take_tcp_listener(
+        &mut self,
+        address: ServerAddr,
+    ) -> Result<VirtualTcpListener, NetworkError> {
         self.incoming
+            .get_mut(&address)
+            .ok_or(NetworkError::ServerNotBound(address))?
             .take()
             .map(VirtualTcpListener::new)
-            .ok_or(NetworkError::IncomingAlreadyTaken)
+            .ok_or(NetworkError::ListenerAlreadyTaken(address))
     }
 
-    pub fn take_incoming(&mut self) -> Result<VirtualTcpListener, NetworkError> {
-        self.take_tcp_listener()
-    }
-
-    pub fn take_udp_listener(&mut self) -> Result<VirtualUdpListener, NetworkError> {
+    pub fn take_udp_listener(
+        &mut self,
+        address: ServerAddr,
+    ) -> Result<VirtualUdpListener, NetworkError> {
         self.incoming_datagrams
+            .get_mut(&address)
+            .ok_or(NetworkError::ServerNotBound(address))?
             .take()
             .map(VirtualUdpListener::new)
-            .ok_or(NetworkError::IncomingAlreadyTaken)
+            .ok_or(NetworkError::ListenerAlreadyTaken(address))
     }
 
     /// Opens a reliable, ordered byte stream to a virtual server address.
-    pub async fn connect(&self, target: &PeerDescriptor) -> Result<VirtualTcpStream, NetworkError> {
-        self.dialer().connect(target).await
+    pub async fn connect(
+        &self,
+        source: ClientAddr,
+        target: &PeerDescriptor,
+    ) -> Result<VirtualTcpStream, NetworkError> {
+        if !self.local_bindings.contains_client(source) {
+            return Err(NetworkError::ClientNotBound(source));
+        }
+        self.dialer().connect(source, target).await
     }
 
     /// Opens a reliable stream using only the application-visible virtual server address.
     pub async fn connect_virtual(
         &self,
+        source: ClientAddr,
         directory: &PresenceDirectory,
         app_addr: AppAddr,
         now_ms: u64,
     ) -> Result<VirtualTcpStream, NetworkError> {
         self.dialer()
-            .connect_virtual(directory, app_addr, now_ms)
+            .connect_virtual(source, directory, app_addr, now_ms)
             .await
     }
 
     pub async fn connect_tonic(
         &self,
+        source: ClientAddr,
         target: &PeerDescriptor,
     ) -> Result<VirtualTcpStream, NetworkError> {
-        self.connect(target).await
+        self.connect(source, target).await
     }
 
     pub async fn connect_udp(
         &self,
+        source: ClientAddr,
         target: &PeerDescriptor,
     ) -> Result<VirtualUdpSocket, NetworkError> {
+        if !self.local_bindings.contains_client(source) {
+            return Err(NetworkError::ClientNotBound(source));
+        }
         if target.network_id != self.network_id {
             return Err(NetworkError::NetworkMismatch {
                 local: self.network_id,
@@ -1951,7 +1947,7 @@ impl WeaverEndpoint {
         };
         let request = OpenStreamRequest {
             network_id: self.network_id,
-            source: self.local_addr,
+            source: source.scoped(),
             destination: peer_addr,
         }
         .encode_datagram()?;
@@ -1971,26 +1967,27 @@ impl WeaverEndpoint {
             .map_err(|error| NetworkError::OpenStream(Box::new(error)))?;
         Ok(VirtualUdpSocket::new(
             connection,
-            self.local_addr,
+            source.scoped(),
             peer_addr,
         ))
     }
 
     pub async fn connect_udp_virtual(
         &self,
+        source: ClientAddr,
         directory: &PresenceDirectory,
         app_addr: AppAddr,
         now_ms: u64,
     ) -> Result<VirtualUdpSocket, NetworkError> {
         let target = discovered_descriptor(self.network_id, directory, app_addr, now_ms)?;
-        self.connect_udp(&target).await
+        self.connect_udp(source, &target).await
     }
 
     pub fn dialer(&self) -> WeaverDialer {
         WeaverDialer {
             endpoint: self.endpoint.clone(),
             network_id: self.network_id(),
-            local_addr: self.local_addr(),
+            local_bindings: self.local_bindings.clone(),
         }
     }
 
@@ -2055,7 +2052,7 @@ impl WeaverEndpoint {
 pub struct WeaverDialer {
     endpoint: Endpoint,
     network_id: NetworkId,
-    local_addr: ScopedVirtualAddr,
+    local_bindings: LocalBindings,
 }
 
 impl WeaverDialer {
@@ -2064,8 +2061,15 @@ impl WeaverDialer {
         self.endpoint.network_change().await;
     }
 
-    /// Opens one reliable virtual TCP connection.
-    pub async fn connect(&self, target: &PeerDescriptor) -> Result<VirtualTcpStream, NetworkError> {
+    /// Opens one reliable virtual TCP connection using an explicit bound client identity.
+    pub async fn connect(
+        &self,
+        source: ClientAddr,
+        target: &PeerDescriptor,
+    ) -> Result<VirtualTcpStream, NetworkError> {
+        if !self.local_bindings.contains_client(source) {
+            return Err(NetworkError::ClientNotBound(source));
+        }
         if target.network_id != self.network_id {
             return Err(NetworkError::NetworkMismatch {
                 local: self.network_id,
@@ -2096,7 +2100,7 @@ impl WeaverDialer {
         };
         let request = OpenStreamRequest {
             network_id: self.network_id,
-            source: self.local_addr,
+            source: source.scoped(),
             destination: peer_addr,
         }
         .encode()?;
@@ -2113,7 +2117,7 @@ impl WeaverDialer {
                 send,
                 recv,
                 connection,
-                self.local_addr,
+                source.scoped(),
                 peer_addr,
             )),
             OPEN_RESPONSE_NOT_AUTHORIZED => Err(NetworkError::OpenRejected("not authorized")),
@@ -2130,19 +2134,21 @@ impl WeaverDialer {
 
     pub async fn connect_virtual(
         &self,
+        source: ClientAddr,
         directory: &PresenceDirectory,
         app_addr: AppAddr,
         now_ms: u64,
     ) -> Result<VirtualTcpStream, NetworkError> {
         let target = discovered_descriptor(self.network_id, directory, app_addr, now_ms)?;
-        self.connect(&target).await
+        self.connect(source, &target).await
     }
 
     pub async fn connect_tonic(
         &self,
+        source: ClientAddr,
         target: &PeerDescriptor,
     ) -> Result<VirtualTcpStream, NetworkError> {
-        self.connect(target).await
+        self.connect(source, target).await
     }
 
     pub async fn fetch_config_updates(
@@ -2564,16 +2570,12 @@ struct AcceptServices {
     config_update_source: Option<Arc<dyn ConfigUpdateSource>>,
     presence_store: Option<Arc<dyn OpaquePresenceStore>>,
     authorizer: Arc<dyn NetworkAuthorizer>,
-    incoming_tx: mpsc::Sender<Result<VirtualTcpStream, io::Error>>,
-    datagram_tx: mpsc::Sender<Result<VirtualUdpSocket, io::Error>>,
+    incoming_txs: HashMap<ServerAddr, mpsc::Sender<Result<VirtualTcpStream, io::Error>>>,
+    datagram_txs: HashMap<ServerAddr, mpsc::Sender<Result<VirtualUdpSocket, io::Error>>>,
+    application_routes: HashMap<Vec<u8>, (ServerAddr, bool)>,
 }
 
-async fn accept_connections(
-    endpoint: Endpoint,
-    network_id: NetworkId,
-    local_addr: ScopedVirtualAddr,
-    services: AcceptServices,
-) {
+async fn accept_connections(endpoint: Endpoint, network_id: NetworkId, services: AcceptServices) {
     while let Some(incoming) = endpoint.accept().await {
         let mut accepting = match incoming.accept() {
             Ok(accepting) => accepting,
@@ -2635,10 +2637,13 @@ async fn accept_connections(
             ));
             continue;
         }
-        let datagram_protocol = match local_addr {
-            ScopedVirtualAddr::Server { app } => alpn == udp_alpn(app),
-            ScopedVirtualAddr::Client { .. } => false,
+        let Some((server_addr, datagram_protocol)) =
+            services.application_routes.get(&alpn).copied()
+        else {
+            connection.close(1u32.into(), b"unknown application binding");
+            continue;
         };
+        let local_addr = server_addr.scoped();
         let authorized_addrs = services
             .authorizer
             .authorized_client_addrs(remote_id, local_addr);
@@ -2655,11 +2660,19 @@ async fn accept_connections(
                 local_addr,
                 remote_id,
                 services.authorizer.clone(),
-                services.datagram_tx.clone(),
+                services
+                    .datagram_txs
+                    .get(&server_addr)
+                    .expect("bound UDP route")
+                    .clone(),
             ));
             continue;
         }
-        let tx = services.incoming_tx.clone();
+        let tx = services
+            .incoming_txs
+            .get(&server_addr)
+            .expect("bound TCP route")
+            .clone();
         let authorizer = services.authorizer.clone();
         tokio::spawn(async move {
             let stream_limit = Arc::new(Semaphore::new(MAX_STREAM_HANDLERS_PER_CONNECTION));

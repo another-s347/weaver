@@ -3,8 +3,8 @@ use std::{net::Ipv4Addr, time::Duration};
 use anyhow::{Context, Result};
 use iroh::{RelayUrl, SecretKey};
 use iroh_relay::server::{RelayConfig, Server as RelayServer, ServerConfig};
-use weaver_core::{AppAddr, DeviceId, NetworkId, ScopedVirtualAddr};
-use weaver_net::{NetworkError, NodeConfig, WeaverEndpoint};
+use weaver_core::{AppAddr, ClientAddr, DeviceId, NetworkId, ScopedVirtualAddr, ServerAddr};
+use weaver_net::{LocalBinding, LocalBindings, NetworkError, NodeConfig, WeaverEndpoint};
 
 const NETWORK: NetworkId = NetworkId::from_bytes([0x91; 32]);
 const SERVER_APP: AppAddr = AppAddr::from_bytes([0x92; 32]);
@@ -28,11 +28,12 @@ async fn udp_socket_preserves_message_boundaries_over_forced_relay() -> Result<(
 
     let client_key = SecretKey::generate();
     let wrong_key = SecretKey::generate();
-    let mut server_config = NodeConfig::udp_server(
+    let server_addr = ServerAddr::new(SERVER_APP);
+    let mut server_config = NodeConfig::new(
         SecretKey::generate(),
         Some(relay_url.clone()),
         NETWORK,
-        SERVER_APP,
+        LocalBindings::new([LocalBinding::Server(server_addr)])?,
         [
             (client_key.public(), CLIENT_ADDR),
             (wrong_key.public(), CLIENT_ADDR),
@@ -42,30 +43,32 @@ async fn udp_socket_preserves_message_boundaries_over_forced_relay() -> Result<(
     let mut server = WeaverEndpoint::bind(server_config).await?;
     server.wait_relay_online(Duration::from_secs(10)).await?;
     let target = server.descriptor(SERVER_APP).relay_only();
-    let mut listener = server.take_udp_listener()?;
+    let mut listener = server.take_udp_listener(server_addr)?;
 
-    let mut wrong_config = NodeConfig::client(
+    let wrong_source = ClientAddr::new(CLIENT_APP, DeviceId::from_bytes([0xee; 32]));
+    let mut wrong_config = NodeConfig::new(
         wrong_key,
         Some(relay_url.clone()),
         NETWORK,
-        CLIENT_APP,
-        DeviceId::from_bytes([0xee; 32]),
+        LocalBindings::new([LocalBinding::Client(wrong_source)])?,
+        std::iter::empty(),
     );
     wrong_config.enable_direct_paths = false;
     let wrong = WeaverEndpoint::bind(wrong_config).await?;
     wrong.wait_relay_online(Duration::from_secs(10)).await?;
     assert!(matches!(
-        wrong.connect_udp(&target).await,
+        wrong.connect_udp(wrong_source, &target).await,
         Err(NetworkError::OpenRejected("not authorized"))
     ));
     wrong.close().await;
 
-    let mut client_config = NodeConfig::client(
+    let source = ClientAddr::new(CLIENT_APP, CLIENT_DEVICE);
+    let mut client_config = NodeConfig::new(
         client_key,
         Some(relay_url),
         NETWORK,
-        CLIENT_APP,
-        CLIENT_DEVICE,
+        LocalBindings::new([LocalBinding::Client(source)])?,
+        std::iter::empty(),
     );
     client_config.enable_direct_paths = false;
     let client = WeaverEndpoint::bind(client_config).await?;
@@ -82,7 +85,7 @@ async fn udp_socket_preserves_message_boundaries_over_forced_relay() -> Result<(
         Ok::<_, std::io::Error>(())
     });
 
-    let mut socket = client.connect_udp(&target).await?;
+    let mut socket = client.connect_udp(source, &target).await?;
     let maximum = socket
         .max_datagram_size()
         .context("QUIC datagrams unexpectedly disabled")?;

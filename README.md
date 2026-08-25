@@ -57,7 +57,8 @@ Implemented:
   its peers from the latest signed topology so additions and revocations take effect live;
 - iroh endpoint construction with public discovery disabled;
 - protected `_weaver._udp.local` discovery using rotating network-keyed opaque tags;
-- signed XChaCha20-Poly1305 encrypted presence records, TTL/sequence replay protection,
+- signed XChaCha20-Poly1305 encrypted endpoint presence records carrying all local bindings,
+  with TTL/endpoint-sequence replay protection,
   and a network-scoped live Iroh address lookup that accepts late LAN/relay candidates;
 - automatic background bridging of protected mDNS observations and Iroh address
   publications, including tag rotation, epoch-key hot rotation and network-change republishing;
@@ -66,8 +67,10 @@ Implemented:
 - relay registration, URL/role rotation and removal as signed topology revisions;
 - TLS 1.3 relay serving, member access control, byte-rate/burst limits, bounded key cache,
   and live authority/access-policy reload after administrative revisions;
-- formal `NetworkHandle`/`VirtualNetwork` entry points that open persisted membership,
-  bind explicit `ServerAddr` or `ClientAddr`, discover peers and connect using only `VirtualAddr`;
+- formal `NetworkHandle`/`VirtualNetwork` entry points that open one persisted membership and
+  one transport endpoint with any number of explicit `ServerAddr` and `ClientAddr` bindings;
+- address-qualified listeners and explicit client source selection on every outbound connection,
+  so a multi-role endpoint cannot accidentally use the wrong application identity;
 - generic `VirtualTcpListener` plus reliable `VirtualTcpStream`, implementing Tokio
   `Stream` and `AsyncRead`/`AsyncWrite` rather than a tonic-specific transport;
 - TCP-style write-half shutdown, EOF, idempotent shutdown, write-after-shutdown errors,
@@ -82,6 +85,8 @@ Implemented:
 - config-derived client/server node constructors that require signed endpoint and app
   bindings, support multiple client application addresses per EndpointId, and derive relay
   selection only from a validated `NetworkConfigV1`;
+- independent source and destination application identities, allowing one authenticated
+  `Client { app, device }` to connect to multiple `Server { app }` services in the same network;
 - encrypted stream-open validation of NetworkId, source client address and destination
   server address before any application bytes are exposed;
 - `AppAddr` bound into the negotiated ALPN;
@@ -138,6 +143,23 @@ The production-facing data plane enters through `NetworkMembership` and `Network
 The small runnable tonic demo intentionally retains command-line development bootstrap so it
 can be launched in three terminals without provisioning files; the signed-config path is
 covered by `crates/weaver-net/tests/network_handle.rs`.
+
+A member opens all of its local roles together. There are no single-role `open_server` or
+`open_client` entry points:
+
+```rust
+let mut network = NetworkHandle::open(options, [
+    LocalBinding::Server(profile_hub_server),
+    LocalBinding::Client(profile_hub_gateway),
+]).await?;
+
+let incoming = network.take_tcp_listener(profile_hub_server)?;
+let stream = network.connect_tcp(profile_hub_gateway, remote_agent).await?;
+```
+
+The listener address selects the destination ALPN and queue. The client address selects the
+signed source identity carried by the stream-open request. Both roles share the same EndpointId,
+discovery state, path migration state and config/presence runtimes.
 
 Each `VirtualTcpStream` currently owns an independent QUIC connection. Connection pooling is
 not part of the first-version contract; this keeps lifecycle and revocation semantics simple

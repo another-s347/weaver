@@ -113,22 +113,26 @@ async fn readable_virtual_host_supports_http1_http2_streams_and_websocket() -> R
     apply_updates(&authority, &server_member, &root, now + 7).await?;
     apply_updates(&authority, &client_member, &root, now + 7).await?;
 
-    let mut server = NetworkHandle::open_server(
+    let server_addr = ServerAddr::new(server_app);
+    let mut server = NetworkHandle::open(
         open_options(&server_member, root.clone()),
-        ServerAddr::new(server_app),
+        [weaver_net::LocalBinding::Server(server_addr)],
     )
     .await?;
-    let listener = server.take_tcp_listener()?;
+    let listener = server.take_tcp_listener(server_addr)?;
     let http_server = spawn_http_server(listener, demo_router());
     let client_network = Arc::new(
-        NetworkHandle::open_client(
+        NetworkHandle::open(
             open_options(&client_member, root),
-            ClientAddr::new(client_app, device),
+            [weaver_net::LocalBinding::Client(ClientAddr::new(
+                client_app, device,
+            ))],
         )
         .await?,
     );
     let virtual_name = VirtualName::new(DEFAULT_VIRTUAL_HOST)?;
-    let connector = WeaverHttpConnector::new(client_network.clone());
+    let source = ClientAddr::new(client_app, device);
+    let connector = WeaverHttpConnector::new(client_network.clone(), source);
 
     let unresolved = connector
         .clone()
@@ -229,6 +233,7 @@ async fn readable_virtual_host_supports_http1_http2_streams_and_websocket() -> R
 
     let (mut websocket, response) = connect_websocket(
         client_network.clone(),
+        source,
         virtual_uri("ws", DEFAULT_VIRTUAL_HOST, "/ws")?,
     )
     .await

@@ -7,7 +7,8 @@ use iroh_relay::server::{RelayConfig, Server as RelayServer, ServerConfig};
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status, transport::Endpoint};
 use tower::service_fn;
-use weaver_net::{NodeConfig, PeerConnectInfo, WeaverEndpoint};
+use weaver_core::{ClientAddr, ServerAddr};
+use weaver_net::{LocalBinding, LocalBindings, NodeConfig, PeerConnectInfo, WeaverEndpoint};
 use weaver_tonic_demo::{
     DEMO_APP_ADDR, DEMO_CLIENT_ADDR, DEMO_CLIENT_APP_ADDR, DEMO_CLIENT_DEVICE_ID, DEMO_NETWORK_ID,
     proto::{
@@ -59,11 +60,12 @@ async fn tonic_rpc_runs_over_forced_relay_path() -> Result<()> {
     .parse()?;
 
     let client_key = SecretKey::generate();
-    let mut server_config = NodeConfig::tonic_server(
+    let server_addr = ServerAddr::new(DEMO_APP_ADDR);
+    let mut server_config = NodeConfig::new(
         SecretKey::generate(),
         Some(relay_url.clone()),
         DEMO_NETWORK_ID,
-        DEMO_APP_ADDR,
+        LocalBindings::new([LocalBinding::Server(server_addr)])?,
         [(client_key.public(), DEMO_CLIENT_ADDR)],
     );
     server_config.enable_direct_paths = false;
@@ -74,7 +76,7 @@ async fn tonic_rpc_runs_over_forced_relay_path() -> Result<()> {
     let server_id = server_endpoint.id();
     let expected_client_id = client_key.public();
     let target = server_endpoint.descriptor(DEMO_APP_ADDR).relay_only();
-    let incoming = server_endpoint.take_tcp_listener()?;
+    let incoming = server_endpoint.take_tcp_listener(server_addr)?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let tonic_server = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -88,12 +90,13 @@ async fn tonic_rpc_runs_over_forced_relay_path() -> Result<()> {
             .await
     });
 
-    let mut client_config = NodeConfig::client(
+    let source = ClientAddr::new(DEMO_CLIENT_APP_ADDR, DEMO_CLIENT_DEVICE_ID);
+    let mut client_config = NodeConfig::new(
         client_key,
         Some(relay_url),
         DEMO_NETWORK_ID,
-        DEMO_CLIENT_APP_ADDR,
-        DEMO_CLIENT_DEVICE_ID,
+        LocalBindings::new([LocalBinding::Client(source)])?,
+        std::iter::empty(),
     );
     client_config.enable_direct_paths = false;
     let client_endpoint = WeaverEndpoint::bind(client_config).await?;
@@ -107,7 +110,7 @@ async fn tonic_rpc_runs_over_forced_relay_path() -> Result<()> {
             let target = target.clone();
             async move {
                 dialer
-                    .connect(&target)
+                    .connect(source, &target)
                     .await
                     .map(TokioIo::new)
                     .map_err(std::io::Error::other)

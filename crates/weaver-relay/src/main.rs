@@ -20,7 +20,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use weaver_config::{ConfigHead, ConfigUpdateBatch, RelayRoles};
-use weaver_core::{AppAddr, DeviceId, MemberId, ScopedVirtualAddr, VirtualName};
+use weaver_core::{AppAddr, MemberId, ScopedVirtualAddr, VirtualName};
 use weaver_crypto::{AppBinding, AppRegistrationRequest, MemberRoles, PreparedJoinRequest};
 use weaver_net::{
     ConfigUpdateSource, MemoryOpaquePresenceStore, NetworkAuthorizer, NodeConfig, WeaverEndpoint,
@@ -697,12 +697,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .context("signed relay URL is invalid")?;
         let allowed_peers = authority_guard.allowed_member_endpoints()?;
         drop(authority_guard);
-        let config = NodeConfig::client(
+        let config = NodeConfig::new(
             endpoint_secret,
             Some(relay_url),
             network_id,
-            AppAddr::from_bytes([0; 32]),
-            DeviceId::from_bytes([0; 32]),
+            weaver_net::LocalBindings::control_plane(),
+            std::iter::empty(),
         )
         .with_config_update_source(
             Arc::new(AuthoritySource(authority.clone())),

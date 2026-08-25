@@ -2,16 +2,17 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use iroh::SecretKey;
-use weaver_core::{AppAddr, DeviceId, NetworkId};
+use weaver_core::{AppAddr, NetworkId};
 use weaver_discovery::EncryptedPresenceRecord;
 use weaver_net::{
-    ConfigPeerDescriptor, MemoryOpaquePresenceStore, NetworkError, NodeConfig, WeaverEndpoint,
+    ConfigPeerDescriptor, LocalBindings, MemoryOpaquePresenceStore, NetworkError, NodeConfig,
+    WeaverEndpoint,
 };
 
 fn opaque_record(epoch: u64, key: [u8; 24], marker: u8) -> EncryptedPresenceRecord {
     let ciphertext = [marker; 32];
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"WVRPRS\0\x01");
+    bytes.extend_from_slice(b"WVRPRS\0\x02");
     bytes.extend_from_slice(&epoch.to_be_bytes());
     bytes.extend_from_slice(&key);
     bytes.extend_from_slice(&[0x55; 24]);
@@ -29,12 +30,12 @@ async fn authenticated_members_publish_and_query_opaque_presence() -> Result<()>
     let service_key = SecretKey::generate();
     let store = Arc::new(MemoryOpaquePresenceStore::new(16));
     let service = WeaverEndpoint::bind(
-        NodeConfig::client(
+        NodeConfig::new(
             service_key,
             None,
             network_id,
-            AppAddr::from_bytes([0xa2; 32]),
-            DeviceId::from_bytes([0xa3; 32]),
+            LocalBindings::control_plane(),
+            std::iter::empty(),
         )
         .with_presence_store(store, [publisher_key.public(), reader_key.public()]),
     )
@@ -46,20 +47,20 @@ async fn authenticated_members_publish_and_query_opaque_presence() -> Result<()>
         relay_url: None,
         direct_addresses: descriptor.direct_addresses,
     };
-    let publisher = WeaverEndpoint::bind(NodeConfig::client(
+    let publisher = WeaverEndpoint::bind(NodeConfig::new(
         publisher_key,
         None,
         network_id,
-        AppAddr::from_bytes([0xb1; 32]),
-        DeviceId::from_bytes([0xb2; 32]),
+        LocalBindings::control_plane(),
+        std::iter::empty(),
     ))
     .await?;
-    let reader = WeaverEndpoint::bind(NodeConfig::client(
+    let reader = WeaverEndpoint::bind(NodeConfig::new(
         reader_key,
         None,
         network_id,
-        AppAddr::from_bytes([0xc1; 32]),
-        DeviceId::from_bytes([0xc2; 32]),
+        LocalBindings::control_plane(),
+        std::iter::empty(),
     ))
     .await?;
 
@@ -91,12 +92,12 @@ async fn authenticated_members_publish_and_query_opaque_presence() -> Result<()>
         Err(NetworkError::PresenceRejected)
     ));
 
-    let outsider = WeaverEndpoint::bind(NodeConfig::client(
+    let outsider = WeaverEndpoint::bind(NodeConfig::new(
         outsider_key,
         None,
         network_id,
-        AppAddr::from_bytes([0xd1; 32]),
-        DeviceId::from_bytes([0xd2; 32]),
+        LocalBindings::control_plane(),
+        std::iter::empty(),
     ))
     .await?;
     assert!(matches!(

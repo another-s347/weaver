@@ -29,7 +29,7 @@ struct ProvisionedMember {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn joined_handles_form_a_zero_relay_lan_using_only_virtual_addresses() -> Result<()> {
+async fn one_client_connects_multiple_cross_app_servers_on_a_zero_relay_lan() -> Result<()> {
     let now = now_ms();
     let temp = tempfile::tempdir()?;
     let data_dir = temp.path().join("authority");
@@ -47,7 +47,7 @@ async fn joined_handles_form_a_zero_relay_lan_using_only_virtual_addresses() -> 
     let network_id = root_public.network_id();
     let mut authority = Authority::open(data_dir, [0x51; 32], now + 1).await?;
 
-    let mut server_member = invite_member(
+    let mut first_server_member = invite_member(
         &mut authority,
         network_id,
         MemberRoles::MEMBER.union(MemberRoles::SERVICE),
@@ -55,46 +55,92 @@ async fn joined_handles_form_a_zero_relay_lan_using_only_virtual_addresses() -> 
         now + 2,
     )
     .await?;
+    let mut second_server_member = invite_member(
+        &mut authority,
+        network_id,
+        MemberRoles::MEMBER.union(MemberRoles::SERVICE),
+        0x62,
+        now + 3,
+    )
+    .await?;
     let mut client_member = invite_member(
         &mut authority,
         network_id,
         MemberRoles::MEMBER,
         0x71,
-        now + 3,
+        now + 4,
     )
     .await?;
 
-    let app_root = AppRootKey::generate()?;
-    let app = app_root.app_addr();
+    let first_server_app_root = AppRootKey::generate()?;
+    let first_server_app = first_server_app_root.app_addr();
+    let second_server_app_root = AppRootKey::generate()?;
+    let second_server_app = second_server_app_root.app_addr();
+    let client_app_root = AppRootKey::generate()?;
+    let client_app = client_app_root.app_addr();
     authority
         .register_app(
-            &AppRegistrationRequest::create(&app_root, network_id, 0),
-            now + 4,
+            &AppRegistrationRequest::create(&first_server_app_root, network_id, 0),
+            now + 5,
         )
         .await?;
-    let server_cert =
-        weaver_crypto::MemberCertificate::from_bytes(&server_member.ticket.member_certificate)?;
+    authority
+        .register_app(
+            &AppRegistrationRequest::create(&second_server_app_root, network_id, 0),
+            now + 6,
+        )
+        .await?;
+    authority
+        .register_app(
+            &AppRegistrationRequest::create(&client_app_root, network_id, 0),
+            now + 7,
+        )
+        .await?;
+    let first_server_cert = weaver_crypto::MemberCertificate::from_bytes(
+        &first_server_member.ticket.member_certificate,
+    )?;
     authority
         .authorize_app_binding(
             &AppBinding::issue(
-                &app_root,
+                &first_server_app_root,
                 network_id,
-                server_cert.payload().member_id,
+                first_server_cert.payload().member_id,
                 AppRole::Server,
                 None,
                 now + 30 * 60 * 1_000,
                 Vec::new(),
             )?,
-            now + 5,
+            now + 8,
+        )
+        .await?;
+    let second_server_cert = weaver_crypto::MemberCertificate::from_bytes(
+        &second_server_member.ticket.member_certificate,
+    )?;
+    authority
+        .authorize_app_binding(
+            &AppBinding::issue(
+                &second_server_app_root,
+                network_id,
+                second_server_cert.payload().member_id,
+                AppRole::Server,
+                None,
+                now + 30 * 60 * 1_000,
+                Vec::new(),
+            )?,
+            now + 9,
         )
         .await?;
     let client_cert =
         weaver_crypto::MemberCertificate::from_bytes(&client_member.ticket.member_certificate)?;
-    let device = derive_device_id(network_id, app, &client_member.signing.public_bytes());
+    let device = derive_device_id(
+        network_id,
+        client_app,
+        &client_member.signing.public_bytes(),
+    );
     authority
         .authorize_app_binding(
             &AppBinding::issue(
-                &app_root,
+                &client_app_root,
                 network_id,
                 client_cert.payload().member_id,
                 AppRole::Client,
@@ -102,71 +148,199 @@ async fn joined_handles_form_a_zero_relay_lan_using_only_virtual_addresses() -> 
                 now + 30 * 60 * 1_000,
                 Vec::new(),
             )?,
-            now + 6,
+            now + 10,
+        )
+        .await?;
+
+    let gateway_device = derive_device_id(
+        network_id,
+        client_app,
+        &first_server_member.signing.public_bytes(),
+    );
+    authority
+        .authorize_app_binding(
+            &AppBinding::issue(
+                &client_app_root,
+                network_id,
+                first_server_cert.payload().member_id,
+                AppRole::Client,
+                Some(gateway_device),
+                now + 30 * 60 * 1_000,
+                Vec::new(),
+            )?,
+            now + 11,
         )
         .await?;
 
     let initial_relay = authority.endpoint_secret_key().public();
-    authority.remove_relay(initial_relay, now + 7).await?;
+    authority.remove_relay(initial_relay, now + 12).await?;
 
-    apply_authority_updates(&authority, &mut server_member, &root_public, now + 8).await?;
-    apply_authority_updates(&authority, &mut client_member, &root_public, now + 8).await?;
-    assert_member_retains_forwardable_history(&server_member, &root_public, now + 9).await?;
+    apply_authority_updates(&authority, &mut first_server_member, &root_public, now + 13).await?;
+    apply_authority_updates(
+        &authority,
+        &mut second_server_member,
+        &root_public,
+        now + 13,
+    )
+    .await?;
+    apply_authority_updates(&authority, &mut client_member, &root_public, now + 13).await?;
+    assert_member_retains_forwardable_history(&first_server_member, &root_public, now + 14).await?;
 
-    let server_options = open_options(&server_member, root_public.clone());
+    let first_server_options = open_options(&first_server_member, root_public.clone());
+    let second_server_options = open_options(&second_server_member, root_public.clone());
     let client_options = open_options(&client_member, root_public.clone());
-    let mut server = NetworkHandle::open_server(server_options, ServerAddr::new(app)).await?;
-    let mut tcp_listener = server.take_tcp_listener()?;
-    let mut udp_listener = server.take_udp_listener()?;
+    let first_server_addr = ServerAddr::new(first_server_app);
+    let second_server_addr = ServerAddr::new(second_server_app);
+    let gateway_source = ClientAddr::new(client_app, gateway_device);
+    let mut first_server = NetworkHandle::open(
+        first_server_options,
+        [
+            weaver_net::LocalBinding::Server(first_server_addr),
+            weaver_net::LocalBinding::Client(gateway_source),
+        ],
+    )
+    .await?;
+    let mut second_server = NetworkHandle::open(
+        second_server_options,
+        [weaver_net::LocalBinding::Server(second_server_addr)],
+    )
+    .await?;
+    let mut first_tcp_listener = first_server.take_tcp_listener(first_server_addr)?;
+    let mut first_udp_listener = first_server.take_udp_listener(first_server_addr)?;
+    let mut second_tcp_listener = second_server.take_tcp_listener(second_server_addr)?;
+    let mut second_udp_listener = second_server.take_udp_listener(second_server_addr)?;
     assert!(matches!(
-        NetworkHandle::open_client(
+        NetworkHandle::open(
             client_options.clone(),
-            ClientAddr::new(app, weaver_core::DeviceId::from_bytes([0xff; 32])),
+            [weaver_net::LocalBinding::Client(ClientAddr::new(
+                client_app,
+                weaver_core::DeviceId::from_bytes([0xff; 32])
+            ))],
         )
         .await,
-        Err(NetworkHandleError::ClientAddressMismatch)
+        Err(NetworkHandleError::Authorization(_))
     ));
-    let client = NetworkHandle::open_client(client_options, ClientAddr::new(app, device)).await?;
-    assert_eq!(client.client_addr(), Some(ClientAddr::new(app, device)));
+    let source = ClientAddr::new(client_app, device);
+    let client =
+        NetworkHandle::open(client_options, [weaver_net::LocalBinding::Client(source)]).await?;
+    assert!(client.local_bindings().contains_client(source));
 
-    let target = VirtualAddr::server(network_id, ServerAddr::new(app));
-    let mut outgoing = tokio::time::timeout(Duration::from_secs(10), client.connect_tcp(target))
-        .await
-        .context("virtual TCP discovery timed out")??;
-    let mut incoming =
-        tokio::time::timeout(Duration::from_secs(5), tcp_listener.accept()).await??;
-    outgoing.write_all(b"handle-tcp").await?;
-    let mut tcp_payload = [0_u8; 10];
-    incoming.read_exact(&mut tcp_payload).await?;
-    assert_eq!(&tcp_payload, b"handle-tcp");
+    assert_ne!(client_app, first_server_app);
+    assert_ne!(client_app, second_server_app);
+    let first_target = VirtualAddr::server(network_id, ServerAddr::new(first_server_app));
+    let second_target = VirtualAddr::server(network_id, ServerAddr::new(second_server_app));
+    assert_cross_app_tcp(
+        &client,
+        source,
+        first_target,
+        &mut first_tcp_listener,
+        b"first-tcp",
+    )
+    .await?;
+    assert_cross_app_tcp(
+        &client,
+        source,
+        second_target,
+        &mut second_tcp_listener,
+        b"second-tcp",
+    )
+    .await?;
+    assert_cross_app_udp(
+        &client,
+        source,
+        first_target,
+        &mut first_udp_listener,
+        "first-udp",
+    )
+    .await?;
+    assert_cross_app_udp(
+        &client,
+        source,
+        second_target,
+        &mut second_udp_listener,
+        "second-udp",
+    )
+    .await?;
+    assert_cross_app_tcp(
+        &first_server,
+        gateway_source,
+        second_target,
+        &mut second_tcp_listener,
+        b"multi-role-endpoint",
+    )
+    .await?;
+    assert!(
+        first_server
+            .local_bindings()
+            .contains_server(first_server_addr)
+    );
+    assert!(
+        first_server
+            .local_bindings()
+            .contains_client(gateway_source)
+    );
 
-    let outgoing_udp =
-        tokio::time::timeout(Duration::from_secs(10), client.connect_udp(target)).await??;
-    let mut incoming_udp =
-        tokio::time::timeout(Duration::from_secs(5), udp_listener.accept()).await??;
-    outgoing_udp.send_wait("handle-udp").await?;
-    assert_eq!(incoming_udp.recv().await?, "handle-udp");
-
-    let before_revoke = server.config_head().await;
+    let before_revoke = first_server.config_head().await;
     authority
-        .revoke_member(client_cert.payload().member_id, now + 10)
+        .revoke_member(client_cert.payload().member_id, now + 15)
         .await?;
     let revocation = authority.config_updates_after(before_revoke).await?;
-    server.apply_config_updates(&revocation).await?;
-    let denied = tokio::time::timeout(Duration::from_secs(5), client.connect_tcp(target)).await?;
+    first_server.apply_config_updates(&revocation).await?;
+    let denied = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.connect_tcp(source, first_target),
+    )
+    .await?;
     assert!(denied.is_err(), "revoked client opened a new stream");
 
     let foreign = VirtualAddr::server(
         weaver_core::NetworkId::from_bytes([0xee; 32]),
-        ServerAddr::new(app),
+        ServerAddr::new(first_server_app),
     );
     assert!(matches!(
-        client.connect_tcp(foreign).await,
+        client.connect_tcp(source, foreign).await,
         Err(NetworkHandleError::NetworkMismatch { .. })
     ));
 
     client.close().await;
-    server.close().await;
+    second_server.close().await;
+    first_server.close().await;
+    Ok(())
+}
+
+async fn assert_cross_app_tcp(
+    client: &NetworkHandle,
+    source: ClientAddr,
+    target: VirtualAddr,
+    listener: &mut weaver_net::VirtualTcpListener,
+    payload: &[u8],
+) -> Result<()> {
+    let mut outgoing =
+        tokio::time::timeout(Duration::from_secs(10), client.connect_tcp(source, target))
+            .await
+            .context("cross-application virtual TCP discovery timed out")??;
+    let mut incoming = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    outgoing.write_all(payload).await?;
+    let mut received = vec![0_u8; payload.len()];
+    incoming.read_exact(&mut received).await?;
+    assert_eq!(received, payload);
+    assert_eq!(incoming.peer_addr(), source.scoped());
+    Ok(())
+}
+
+async fn assert_cross_app_udp(
+    client: &NetworkHandle,
+    source: ClientAddr,
+    target: VirtualAddr,
+    listener: &mut weaver_net::VirtualUdpListener,
+    payload: &str,
+) -> Result<()> {
+    let outgoing =
+        tokio::time::timeout(Duration::from_secs(10), client.connect_udp(source, target)).await??;
+    let mut incoming = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    outgoing.send_wait(payload.to_owned()).await?;
+    assert_eq!(incoming.recv().await?, payload);
+    assert_eq!(incoming.peer_addr(), source.scoped());
     Ok(())
 }
 

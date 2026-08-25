@@ -59,11 +59,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to load {}", args.identity.display()))?;
     eprintln!("WARNING: demo identity is plaintext mode-0600, not production SecretStore");
 
-    let config = NodeConfig::tonic_server(
+    let server_addr = weaver_core::ServerAddr::new(DEMO_APP_ADDR);
+    let config = NodeConfig::new(
         secret_key,
         Some(args.relay_url),
         DEMO_NETWORK_ID,
-        DEMO_APP_ADDR,
+        weaver_net::LocalBindings::new([weaver_net::LocalBinding::Server(server_addr)])?,
         args.allow_client
             .into_iter()
             .map(|endpoint_id| (endpoint_id, DEMO_CLIENT_ADDR)),
@@ -79,7 +80,7 @@ async fn main() -> Result<()> {
     println!("server_endpoint_id={}", endpoint.id());
     println!("descriptor={}", args.descriptor.display());
 
-    let incoming = endpoint.take_tcp_listener()?;
+    let incoming = endpoint.take_tcp_listener(server_addr)?;
     let service = EchoService {
         server_endpoint_id: endpoint.id(),
     };

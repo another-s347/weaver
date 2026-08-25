@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use iroh::{RelayUrl, SecretKey};
 use iroh_relay::server::{RelayConfig, Server as RelayServer, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use weaver_core::{AppAddr, DeviceId, NetworkId, ScopedVirtualAddr};
-use weaver_net::{NetworkError, NodeConfig, WeaverEndpoint};
+use weaver_core::{AppAddr, ClientAddr, DeviceId, NetworkId, ScopedVirtualAddr, ServerAddr};
+use weaver_net::{LocalBinding, LocalBindings, NetworkError, NodeConfig, WeaverEndpoint};
 
 const TEST_APP_ADDR: AppAddr = AppAddr::from_bytes([0x54; 32]);
 const TEST_NETWORK_ID: NetworkId = NetworkId::from_bytes([0x4e; 32]);
@@ -41,11 +41,12 @@ async fn reliable_stream_preserves_bytes_order_and_half_close_over_relay() -> Re
     let client_key = SecretKey::generate();
     let wrong_device_key = SecretKey::generate();
     let wrong_network_key = SecretKey::generate();
-    let mut server_config = NodeConfig::tcp_server(
+    let server_addr = ServerAddr::new(TEST_APP_ADDR);
+    let mut server_config = NodeConfig::new(
         SecretKey::generate(),
         Some(relay_url.clone()),
         TEST_NETWORK_ID,
-        TEST_APP_ADDR,
+        LocalBindings::new([LocalBinding::Server(server_addr)])?,
         [
             (client_key.public(), TEST_CLIENT_ADDR),
             (wrong_device_key.public(), TEST_CLIENT_ADDR),
@@ -56,14 +57,15 @@ async fn reliable_stream_preserves_bytes_order_and_half_close_over_relay() -> Re
     let mut server = WeaverEndpoint::bind(server_config).await?;
     server.wait_relay_online(Duration::from_secs(10)).await?;
     let target = server.descriptor(TEST_APP_ADDR).relay_only();
-    let mut listener = server.take_tcp_listener()?;
+    let mut listener = server.take_tcp_listener(server_addr)?;
 
-    let mut client_config = NodeConfig::client(
+    let source = ClientAddr::new(TEST_CLIENT_APP_ADDR, TEST_CLIENT_DEVICE_ID);
+    let mut client_config = NodeConfig::new(
         client_key,
         Some(relay_url),
         TEST_NETWORK_ID,
-        TEST_CLIENT_APP_ADDR,
-        TEST_CLIENT_DEVICE_ID,
+        LocalBindings::new([LocalBinding::Client(source)])?,
+        std::iter::empty(),
     );
     client_config.enable_direct_paths = false;
     let client = WeaverEndpoint::bind(client_config).await?;
@@ -72,23 +74,27 @@ async fn reliable_stream_preserves_bytes_order_and_half_close_over_relay() -> Re
     let mut other_network_target = target.clone();
     other_network_target.network_id = OTHER_NETWORK_ID;
     assert!(matches!(
-        client.connect(&other_network_target).await,
+        client.connect(source, &other_network_target).await,
         Err(NetworkError::NetworkMismatch { .. })
     ));
 
-    let mut wrong_device_config = NodeConfig::client(
+    let wrong_source = ClientAddr::new(TEST_CLIENT_APP_ADDR, DeviceId::from_bytes([0xee; 32]));
+    let mut wrong_device_config = NodeConfig::new(
         wrong_device_key,
         target.relay_url.clone(),
         TEST_NETWORK_ID,
-        TEST_CLIENT_APP_ADDR,
-        DeviceId::from_bytes([0xee; 32]),
+        LocalBindings::new([LocalBinding::Client(wrong_source)])?,
+        std::iter::empty(),
     );
     wrong_device_config.enable_direct_paths = false;
     let wrong_device = WeaverEndpoint::bind(wrong_device_config).await?;
     wrong_device
         .wait_relay_online(Duration::from_secs(10))
         .await?;
-    let wrong_device_error = wrong_device.connect(&target).await.unwrap_err();
+    let wrong_device_error = wrong_device
+        .connect(wrong_source, &target)
+        .await
+        .unwrap_err();
     assert!(
         matches!(
             wrong_device_error,
@@ -98,12 +104,12 @@ async fn reliable_stream_preserves_bytes_order_and_half_close_over_relay() -> Re
     );
     wrong_device.close().await;
 
-    let mut wrong_network_config = NodeConfig::client(
+    let mut wrong_network_config = NodeConfig::new(
         wrong_network_key,
         target.relay_url.clone(),
         OTHER_NETWORK_ID,
-        TEST_CLIENT_APP_ADDR,
-        TEST_CLIENT_DEVICE_ID,
+        LocalBindings::new([LocalBinding::Client(source)])?,
+        std::iter::empty(),
     );
     wrong_network_config.enable_direct_paths = false;
     let wrong_network = WeaverEndpoint::bind(wrong_network_config).await?;
@@ -111,7 +117,7 @@ async fn reliable_stream_preserves_bytes_order_and_half_close_over_relay() -> Re
         .wait_relay_online(Duration::from_secs(10))
         .await?;
     let wrong_network_error = wrong_network
-        .connect(&other_network_target)
+        .connect(source, &other_network_target)
         .await
         .unwrap_err();
     assert!(
@@ -145,7 +151,7 @@ async fn reliable_stream_preserves_bytes_order_and_half_close_over_relay() -> Re
         Ok::<_, std::io::Error>(())
     });
 
-    let mut stream = client.connect(&target).await?;
+    let mut stream = client.connect(source, &target).await?;
     let mut greeting = [0; 12];
     stream.read_exact(&mut greeting).await?;
     assert_eq!(&greeting, b"server ready");

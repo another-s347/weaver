@@ -19,10 +19,10 @@ use weaver_store::{
 use crate::{
     ConfigAuthorizationError, ConfigPeerDescriptor, ConfigStateError, ConfigSyncEvent,
     ConfigSyncOptions, ConfigSyncRuntime, ConfigSyncState, LiveConfigAuthorizer, LiveConfigState,
-    MemberConfigSource, NetworkError, NodeConfig, PersistedConfigState, PresenceSyncOptions,
-    PresenceSyncRuntime, VirtualTcpListener, VirtualTcpStream, VirtualUdpListener,
-    VirtualUdpSocket, WeaverEndpoint, config_peer_descriptors, spawn_config_anti_entropy,
-    spawn_live_presence_sync, udp_alpn,
+    LocalBinding, LocalBindings, LocalBindingsError, MemberConfigSource, NetworkError, NodeConfig,
+    PersistedConfigState, PresenceSyncOptions, PresenceSyncRuntime, VirtualTcpListener,
+    VirtualTcpStream, VirtualUdpListener, VirtualUdpSocket, WeaverEndpoint,
+    config_peer_descriptors, spawn_config_anti_entropy, spawn_live_presence_sync,
 };
 
 #[derive(Clone)]
@@ -52,12 +52,6 @@ impl std::fmt::Debug for NetworkHandleOpenOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LocalBinding {
-    Server(ServerAddr),
-    Client(ClientAddr),
-}
-
 pub struct NetworkHandle {
     network_id: NetworkId,
     endpoint: WeaverEndpoint,
@@ -77,31 +71,18 @@ impl std::fmt::Debug for NetworkHandle {
         f.debug_struct("NetworkHandle")
             .field("network_id", &self.network_id)
             .field("endpoint_id", &self.endpoint.id())
-            .field("local_addr", &self.endpoint.local_addr())
+            .field("local_bindings", &self.endpoint.local_bindings())
             .finish_non_exhaustive()
     }
 }
 
 impl NetworkHandle {
-    pub async fn open_server(
-        options: NetworkHandleOpenOptions,
-        address: ServerAddr,
-    ) -> Result<Self, NetworkHandleError> {
-        Self::open(options, LocalBinding::Server(address)).await
-    }
-
-    pub async fn open_client(
-        options: NetworkHandleOpenOptions,
-        address: ClientAddr,
-    ) -> Result<Self, NetworkHandleError> {
-        Self::open(options, LocalBinding::Client(address)).await
-    }
-
     pub async fn open(
         options: NetworkHandleOpenOptions,
-        binding: LocalBinding,
+        bindings: impl IntoIterator<Item = LocalBinding>,
     ) -> Result<Self, NetworkHandleError> {
         validate_store_capabilities(&options)?;
+        let bindings = LocalBindings::new(bindings)?;
         let network_id = options.root.network_id();
         let endpoint_secret = open_secret_32(
             options.secret_store.as_ref(),
@@ -141,21 +122,7 @@ impl NetworkHandle {
         let source = Arc::new(MemberConfigSource::new(live_state.clone()));
         let lookup = Arc::new(WeaverAddressLookup::new(network_id));
 
-        let mut node = match binding {
-            LocalBinding::Server(address) => {
-                let mut node =
-                    NodeConfig::tcp_server_from_config(endpoint_secret, &config, address.app())?;
-                node.accept_alpns.push(udp_alpn(address.app()));
-                node
-            }
-            LocalBinding::Client(address) => {
-                let node = NodeConfig::client_from_config(endpoint_secret, &config, address.app())?;
-                if node.local_addr != address.scoped() {
-                    return Err(NetworkHandleError::ClientAddressMismatch);
-                }
-                node
-            }
-        };
+        let mut node = NodeConfig::from_config(endpoint_secret, &config, bindings)?;
         node = node
             .with_address_lookup(lookup.clone())
             .with_authorizer(authorizer.clone())
@@ -231,27 +198,27 @@ impl NetworkHandle {
         self.endpoint.id()
     }
 
-    pub fn local_addr(&self) -> ScopedVirtualAddr {
-        self.endpoint.local_addr()
+    pub fn local_bindings(&self) -> &LocalBindings {
+        self.endpoint.local_bindings()
     }
 
-    pub fn client_addr(&self) -> Option<ClientAddr> {
-        match self.local_addr() {
-            ScopedVirtualAddr::Client { app, device } => Some(ClientAddr::new(app, device)),
-            ScopedVirtualAddr::Server { .. } => None,
-        }
+    pub fn take_tcp_listener(
+        &mut self,
+        address: ServerAddr,
+    ) -> Result<VirtualTcpListener, NetworkHandleError> {
+        Ok(self.endpoint.take_tcp_listener(address)?)
     }
 
-    pub fn take_tcp_listener(&mut self) -> Result<VirtualTcpListener, NetworkHandleError> {
-        Ok(self.endpoint.take_tcp_listener()?)
-    }
-
-    pub fn take_udp_listener(&mut self) -> Result<VirtualUdpListener, NetworkHandleError> {
-        Ok(self.endpoint.take_udp_listener()?)
+    pub fn take_udp_listener(
+        &mut self,
+        address: ServerAddr,
+    ) -> Result<VirtualUdpListener, NetworkHandleError> {
+        Ok(self.endpoint.take_udp_listener(address)?)
     }
 
     pub async fn connect_tcp(
         &self,
+        source: ClientAddr,
         target: VirtualAddr,
     ) -> Result<VirtualTcpStream, NetworkHandleError> {
         let app = self.validate_server_target(target)?;
@@ -259,13 +226,16 @@ impl NetworkHandle {
         Ok(self
             .endpoint
             .dialer()
-            .connect(&crate::PeerDescriptor {
-                network_id: self.network_id,
-                app_addr: app,
-                endpoint_id,
-                relay_url: None,
-                direct_addresses: Vec::new(),
-            })
+            .connect(
+                source,
+                &crate::PeerDescriptor {
+                    network_id: self.network_id,
+                    app_addr: app,
+                    endpoint_id,
+                    relay_url: None,
+                    direct_addresses: Vec::new(),
+                },
+            )
             .await?)
     }
 
@@ -280,37 +250,43 @@ impl NetworkHandle {
 
     pub async fn connect_tcp_name(
         &self,
+        source: ClientAddr,
         name: &VirtualName,
     ) -> Result<VirtualTcpStream, NetworkHandleError> {
         let address = self.resolve_name(name)?;
-        self.connect_tcp(VirtualAddr::server(self.network_id, address))
+        self.connect_tcp(source, VirtualAddr::server(self.network_id, address))
             .await
     }
 
     pub async fn connect_udp(
         &self,
+        source: ClientAddr,
         target: VirtualAddr,
     ) -> Result<VirtualUdpSocket, NetworkHandleError> {
         let app = self.validate_server_target(target)?;
         let endpoint_id = self.resolve_configured_server(app)?;
         Ok(self
             .endpoint
-            .connect_udp(&crate::PeerDescriptor {
-                network_id: self.network_id,
-                app_addr: app,
-                endpoint_id,
-                relay_url: None,
-                direct_addresses: Vec::new(),
-            })
+            .connect_udp(
+                source,
+                &crate::PeerDescriptor {
+                    network_id: self.network_id,
+                    app_addr: app,
+                    endpoint_id,
+                    relay_url: None,
+                    direct_addresses: Vec::new(),
+                },
+            )
             .await?)
     }
 
     pub async fn connect_udp_name(
         &self,
+        source: ClientAddr,
         name: &VirtualName,
     ) -> Result<VirtualUdpSocket, NetworkHandleError> {
         let address = self.resolve_name(name)?;
-        self.connect_udp(VirtualAddr::server(self.network_id, address))
+        self.connect_udp(source, VirtualAddr::server(self.network_id, address))
             .await
     }
 
@@ -448,10 +424,10 @@ pub enum NetworkHandleError {
     NetworkMismatch { local: NetworkId, target: NetworkId },
     #[error("this operation requires a virtual server target")]
     TargetMustBeServer,
-    #[error("requested client address does not match the authorized device binding")]
-    ClientAddressMismatch,
     #[error("virtual DNS name is unknown or expired in this network: {0}")]
     UnknownVirtualName(VirtualName),
+    #[error(transparent)]
+    Bindings(#[from] LocalBindingsError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]

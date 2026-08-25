@@ -61,12 +61,13 @@ async fn main() -> Result<()> {
             let key = load_or_create_dev_identity(&identity)
                 .with_context(|| format!("failed to load {}", identity.display()))?;
             eprintln!("WARNING: demo identity is plaintext mode-0600, not production SecretStore");
-            let mut node_config = NodeConfig::client(
+            let source = weaver_core::ClientAddr::new(DEMO_CLIENT_APP_ADDR, DEMO_CLIENT_DEVICE_ID);
+            let mut node_config = NodeConfig::new(
                 key,
                 Some(relay_url),
                 DEMO_NETWORK_ID,
-                DEMO_CLIENT_APP_ADDR,
-                DEMO_CLIENT_DEVICE_ID,
+                weaver_net::LocalBindings::new([weaver_net::LocalBinding::Client(source)])?,
+                std::iter::empty(),
             );
             node_config.enable_direct_paths = !relay_only;
             let endpoint = WeaverEndpoint::bind(node_config).await?;
@@ -88,7 +89,7 @@ async fn main() -> Result<()> {
                     let target = connector_target.clone();
                     async move {
                         dialer
-                            .connect(&target)
+                            .connect(source, &target)
                             .await
                             .map(TokioIo::new)
                             .map_err(std::io::Error::other)

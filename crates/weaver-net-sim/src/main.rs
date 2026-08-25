@@ -13,7 +13,7 @@ use iroh::{RelayUrl, SecretKey};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use weaver_config::{EpochSecrets, NetworkConfigV1, NetworkPolicy, ValidatedNetworkConfig};
-use weaver_core::{AppAddr, DeviceId, NetworkId, ScopedVirtualAddr};
+use weaver_core::{AppAddr, ClientAddr, DeviceId, NetworkId, ScopedVirtualAddr, ServerAddr};
 use weaver_crypto::{
     AppBinding, AppRegistration, AppRole, AppRootKey, EndpointBinding, MemberCertificate,
     MemberRoles, NetworkRootKey, SigningKeypair,
@@ -22,7 +22,10 @@ use weaver_discovery::{
     AddressLookupSource, AddressLookupUpdate, LanDiscoveryTrigger, MdnsLanDiscovery,
     ProtectedLanDiscovery, WeaverAddressLookup, spawn_lan_discovery_runtime,
 };
-use weaver_net::{NodeConfig, PeerDescriptor, TransportPathKind, VirtualTcpStream, WeaverEndpoint};
+use weaver_net::{
+    LocalBinding, LocalBindings, NodeConfig, PeerDescriptor, TransportPathKind, VirtualTcpStream,
+    WeaverEndpoint,
+};
 
 const SERVER_ENDPOINT_SECRET: [u8; 32] = [0x11; 32];
 const CLIENT_ENDPOINT_SECRET: [u8; 32] = [0x22; 32];
@@ -101,11 +104,11 @@ async fn run_server(relay_url: RelayUrl) -> Result<()> {
     let lookup = Arc::new(WeaverAddressLookup::new(fixture.network_id));
     let publications = lookup.subscribe_publications();
     let mut endpoint = WeaverEndpoint::bind(
-        NodeConfig::tcp_server(
+        NodeConfig::new(
             server_key,
             Some(relay_url),
             fixture.network_id,
-            fixture.server_app,
+            LocalBindings::new([LocalBinding::Server(ServerAddr::new(fixture.server_app))])?,
             [(client_key.public(), fixture.client_addr)],
         )
         .with_address_lookup(lookup.clone()),
@@ -119,7 +122,7 @@ async fn run_server(relay_url: RelayUrl) -> Result<()> {
         lookup,
         publications,
     )?;
-    let mut listener = endpoint.take_tcp_listener()?;
+    let mut listener = endpoint.take_tcp_listener(ServerAddr::new(fixture.server_app))?;
     let _network_changes = spawn_network_change_signal(endpoint.dialer(), discovery.trigger());
     println!("SIM_SERVER_READY");
 
@@ -144,12 +147,15 @@ async fn run_client(
     let publications = lookup.subscribe_publications();
     let mut lookup_updates = lookup.subscribe_updates();
     let endpoint = WeaverEndpoint::bind(
-        NodeConfig::client(
+        NodeConfig::new(
             SecretKey::from_bytes(&CLIENT_ENDPOINT_SECRET),
             Some(relay_url.clone()),
             fixture.network_id,
-            fixture.client_app,
-            CLIENT_DEVICE,
+            LocalBindings::new([LocalBinding::Client(ClientAddr::new(
+                fixture.client_app,
+                CLIENT_DEVICE,
+            ))])?,
+            std::iter::empty(),
         )
         .with_address_lookup(lookup.clone()),
     )
@@ -170,7 +176,9 @@ async fn run_client(
         relay_url: Some(relay_url),
         direct_addresses: Vec::new(),
     };
-    let mut stream = endpoint.connect(&target).await?;
+    let mut stream = endpoint
+        .connect(ClientAddr::new(fixture.client_app, CLIENT_DEVICE), &target)
+        .await?;
     let peer_before = stream.peer_endpoint_id();
     let initial_path = selected_path(&stream);
     let mut saw_relay = initial_path == "relay";

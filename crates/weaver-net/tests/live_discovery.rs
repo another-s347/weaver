@@ -3,9 +3,11 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use iroh::SecretKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use weaver_core::{AppAddr, DeviceId, NetworkId, ScopedVirtualAddr};
+use weaver_core::{AppAddr, ClientAddr, DeviceId, NetworkId, ScopedVirtualAddr, ServerAddr};
 use weaver_discovery::{LanObservation, PresenceDirectory, WeaverAddressLookup};
-use weaver_net::{NetworkError, NodeConfig, PeerDescriptor, WeaverEndpoint};
+use weaver_net::{
+    LocalBinding, LocalBindings, NetworkError, NodeConfig, PeerDescriptor, WeaverEndpoint,
+};
 
 const NETWORK: NetworkId = NetworkId::from_bytes([0xd1; 32]);
 const SERVER_APP: AppAddr = AppAddr::from_bytes([0xd2; 32]);
@@ -22,17 +24,17 @@ async fn connect_started_with_only_endpoint_id_completes_after_live_lan_discover
     let server_lookup = Arc::new(WeaverAddressLookup::new(NETWORK));
     let mut local_publication = server_lookup.subscribe_publications();
     let mut server = WeaverEndpoint::bind(
-        NodeConfig::tcp_server(
+        NodeConfig::new(
             SecretKey::generate(),
             None,
             NETWORK,
-            SERVER_APP,
+            LocalBindings::new([LocalBinding::Server(ServerAddr::new(SERVER_APP))])?,
             [(client_key.public(), CLIENT_ADDR)],
         )
         .with_address_lookup(server_lookup),
     )
     .await?;
-    let mut listener = server.take_tcp_listener()?;
+    let mut listener = server.take_tcp_listener(ServerAddr::new(SERVER_APP))?;
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -61,14 +63,23 @@ async fn connect_started_with_only_endpoint_id_completes_after_live_lan_discover
 
     let client_lookup = Arc::new(WeaverAddressLookup::new(NETWORK));
     let client = WeaverEndpoint::bind(
-        NodeConfig::client(client_key, None, NETWORK, CLIENT_APP, CLIENT_DEVICE)
-            .with_address_lookup(client_lookup.clone()),
+        NodeConfig::new(
+            client_key,
+            None,
+            NETWORK,
+            LocalBindings::new([LocalBinding::Client(ClientAddr::new(
+                CLIENT_APP,
+                CLIENT_DEVICE,
+            ))])?,
+            std::iter::empty(),
+        )
+        .with_address_lookup(client_lookup.clone()),
     )
     .await?;
     let empty_directory = PresenceDirectory::new(NETWORK, client_lookup.clone());
     assert!(matches!(
         client
-            .connect_virtual(&empty_directory, SERVER_APP, 1_000)
+            .connect_virtual(ClientAddr::new(CLIENT_APP, CLIENT_DEVICE), &empty_directory, SERVER_APP, 1_000)
             .await,
         Err(NetworkError::VirtualAddressUnresolved(address)) if address == SERVER_APP
     ));
@@ -79,7 +90,12 @@ async fn connect_started_with_only_endpoint_id_completes_after_live_lan_discover
     );
     assert!(matches!(
         client
-            .connect_virtual(&foreign_directory, SERVER_APP, 1_000)
+            .connect_virtual(
+                ClientAddr::new(CLIENT_APP, CLIENT_DEVICE),
+                &foreign_directory,
+                SERVER_APP,
+                1_000
+            )
             .await,
         Err(NetworkError::NetworkMismatch { .. })
     ));
@@ -91,7 +107,11 @@ async fn connect_started_with_only_endpoint_id_completes_after_live_lan_discover
         direct_addresses: Vec::new(),
     };
     let dialer = client.dialer();
-    let connect_task = tokio::spawn(async move { dialer.connect(&target).await });
+    let connect_task = tokio::spawn(async move {
+        dialer
+            .connect(ClientAddr::new(CLIENT_APP, CLIENT_DEVICE), &target)
+            .await
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         !connect_task.is_finished(),

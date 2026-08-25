@@ -33,13 +33,14 @@ pub const MDNS_SERVICE_TYPE: &str = "_weaver._udp.local";
 pub const LAN_SLOT_MS: u64 = 5 * 60 * 1_000;
 pub const DEFAULT_PRESENCE_TTL_MS: u64 = 120 * 1_000;
 pub const MAX_PRESENCE_TTL_MS: u64 = 5 * 60 * 1_000;
-const PRESENCE_MAGIC: &[u8; 8] = b"WVRPRS\0\x01";
-const PRESENCE_PAYLOAD_MAGIC: &[u8; 8] = b"WVRPRP\0\x01";
+const PRESENCE_MAGIC: &[u8; 8] = b"WVRPRS\0\x02";
+const PRESENCE_PAYLOAD_MAGIC: &[u8; 8] = b"WVRPRP\0\x02";
 const TAG_LEN: usize = 16;
 const OPAQUE_KEY_LEN: usize = 24;
 const NONCE_LEN: usize = 24;
 const SIGNATURE_LEN: usize = 64;
 const MAX_CANDIDATES: usize = 16;
+const MAX_VIRTUAL_ADDRS: usize = 256;
 const MAX_RELAY_URL_LEN: usize = 2048;
 const MAX_PRESENCE_WIRE: usize = 16 * 1024;
 
@@ -749,7 +750,7 @@ pub enum DiscoveryCandidate {
 pub struct PresenceRecord {
     pub network_id: NetworkId,
     pub epoch: u64,
-    pub virtual_addr: ScopedVirtualAddr,
+    pub virtual_addrs: Vec<ScopedVirtualAddr>,
     pub member_id: MemberId,
     pub endpoint_id: EndpointId,
     pub candidates: Vec<DiscoveryCandidate>,
@@ -792,7 +793,7 @@ impl EncryptedPresenceRecord {
         config: &ValidatedNetworkConfig,
         signing: &SigningKeypair,
         endpoint_id: EndpointId,
-        virtual_addr: ScopedVirtualAddr,
+        virtual_addrs: Vec<ScopedVirtualAddr>,
         candidates: Vec<DiscoveryCandidate>,
         capabilities: u32,
         sequence: u64,
@@ -804,22 +805,33 @@ impl EncryptedPresenceRecord {
             || expires_at_ms - issued_at_ms > MAX_PRESENCE_TTL_MS
             || expires_at_ms > snapshot.expires_at_ms
             || candidates.len() > MAX_CANDIDATES
+            || virtual_addrs.is_empty()
+            || virtual_addrs.len() > MAX_VIRTUAL_ADDRS
         {
             return Err(DiscoveryError::InvalidPresence);
         }
         validate_candidates(&candidates)?;
         let member = member_for_signer(config, signing.public_bytes())?;
-        authorize_endpoint_and_addr(
-            config,
-            member.payload().member_id,
-            endpoint_id,
-            virtual_addr,
-            issued_at_ms,
-        )?;
+        let unique_addrs = virtual_addrs
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if unique_addrs.len() != virtual_addrs.len() {
+            return Err(DiscoveryError::InvalidPresence);
+        }
+        for virtual_addr in &virtual_addrs {
+            authorize_endpoint_and_addr(
+                config,
+                member.payload().member_id,
+                endpoint_id,
+                *virtual_addr,
+                issued_at_ms,
+            )?;
+        }
         let record = PresenceRecord {
             network_id: snapshot.network_id,
             epoch: snapshot.epoch,
-            virtual_addr,
+            virtual_addrs,
             member_id: member.payload().member_id,
             endpoint_id,
             candidates,
@@ -939,13 +951,26 @@ impl EncryptedPresenceRecord {
             return Err(DiscoveryError::InvalidPresence);
         }
         member.verify_presence(payload, &signature)?;
-        authorize_endpoint_and_addr(
-            config,
-            record.member_id,
-            record.endpoint_id,
-            record.virtual_addr,
-            now_ms,
-        )?;
+        if record.virtual_addrs.is_empty() || record.virtual_addrs.len() > MAX_VIRTUAL_ADDRS {
+            return Err(DiscoveryError::InvalidPresence);
+        }
+        let unique_addrs = record
+            .virtual_addrs
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if unique_addrs.len() != record.virtual_addrs.len() {
+            return Err(DiscoveryError::InvalidPresence);
+        }
+        for virtual_addr in &record.virtual_addrs {
+            authorize_endpoint_and_addr(
+                config,
+                record.member_id,
+                record.endpoint_id,
+                *virtual_addr,
+                now_ms,
+            )?;
+        }
         validate_candidates(&record.candidates)?;
         Ok(record)
     }
@@ -954,12 +979,13 @@ impl EncryptedPresenceRecord {
 #[derive(Default, Debug)]
 pub struct PresenceCache {
     records: HashMap<(NetworkId, ScopedVirtualAddr), PresenceRecord>,
+    endpoint_records: HashMap<(NetworkId, EndpointId), PresenceRecord>,
 }
 
 impl PresenceCache {
     pub fn apply(&mut self, record: PresenceRecord) -> Result<bool, DiscoveryError> {
-        let key = (record.network_id, record.virtual_addr);
-        if let Some(current) = self.records.get(&key) {
+        let endpoint_key = (record.network_id, record.endpoint_id);
+        if let Some(current) = self.endpoint_records.get(&endpoint_key) {
             if record.sequence < current.sequence
                 || (record.sequence == current.sequence && record != *current)
             {
@@ -969,7 +995,22 @@ impl PresenceCache {
                 return Ok(false);
             }
         }
-        self.records.insert(key, record);
+        if record.virtual_addrs.iter().any(|address| {
+            self.records
+                .get(&(record.network_id, *address))
+                .is_some_and(|current| current.endpoint_id != record.endpoint_id)
+        }) {
+            return Err(DiscoveryError::InvalidPresence);
+        }
+        if let Some(previous) = self.endpoint_records.insert(endpoint_key, record.clone()) {
+            for address in previous.virtual_addrs {
+                self.records.remove(&(previous.network_id, address));
+            }
+        }
+        for address in &record.virtual_addrs {
+            self.records
+                .insert((record.network_id, *address), record.clone());
+        }
         Ok(true)
     }
 
@@ -985,21 +1026,23 @@ impl PresenceCache {
     }
 
     pub fn purge_expired(&mut self, now_ms: u64) -> Vec<EndpointId> {
-        let mut removed = Vec::new();
-        self.records.retain(|_, record| {
-            let retain = record.expires_at_ms > now_ms;
-            if !retain {
-                removed.push(record.endpoint_id);
-            }
-            retain
-        });
+        let removed = self
+            .endpoint_records
+            .iter()
+            .filter(|(_, record)| record.expires_at_ms <= now_ms)
+            .map(|((_, endpoint), _)| *endpoint)
+            .collect::<Vec<_>>();
+        self.endpoint_records
+            .retain(|_, record| record.expires_at_ms > now_ms);
+        self.records
+            .retain(|_, record| record.expires_at_ms > now_ms);
         removed
     }
 
     fn contains_endpoint(&self, endpoint_id: EndpointId) -> bool {
-        self.records
-            .values()
-            .any(|record| record.endpoint_id == endpoint_id)
+        self.endpoint_records
+            .keys()
+            .any(|(_, endpoint)| *endpoint == endpoint_id)
     }
 }
 
@@ -1266,7 +1309,12 @@ fn encode_presence_payload(record: &PresenceRecord) -> Result<Vec<u8>, Discovery
     out.extend_from_slice(PRESENCE_PAYLOAD_MAGIC);
     out.extend_from_slice(record.network_id.as_bytes());
     out.extend_from_slice(&record.epoch.to_be_bytes());
-    encode_virtual_addr(&mut out, record.virtual_addr);
+    let address_count =
+        u16::try_from(record.virtual_addrs.len()).map_err(|_| DiscoveryError::PresenceTooLarge)?;
+    out.extend_from_slice(&address_count.to_be_bytes());
+    for address in &record.virtual_addrs {
+        encode_virtual_addr(&mut out, *address);
+    }
     out.extend_from_slice(record.member_id.as_bytes());
     out.extend_from_slice(record.endpoint_id.as_bytes());
     out.extend_from_slice(&record.capabilities.to_be_bytes());
@@ -1307,7 +1355,14 @@ fn decode_presence_payload(bytes: &[u8]) -> Result<PresenceRecord, DiscoveryErro
     decoder.magic(PRESENCE_PAYLOAD_MAGIC)?;
     let network_id = NetworkId::from_bytes(decoder.array()?);
     let epoch = decoder.u64()?;
-    let virtual_addr = decode_virtual_addr(&mut decoder)?;
+    let address_count = decoder.u16()? as usize;
+    if address_count == 0 || address_count > MAX_VIRTUAL_ADDRS {
+        return Err(DiscoveryError::InvalidPresence);
+    }
+    let mut virtual_addrs = Vec::with_capacity(address_count);
+    for _ in 0..address_count {
+        virtual_addrs.push(decode_virtual_addr(&mut decoder)?);
+    }
     let member_id = MemberId::from_bytes(decoder.array()?);
     let endpoint_id =
         EndpointId::from_bytes(&decoder.array()?).map_err(|_| DiscoveryError::MalformedEndpoint)?;
@@ -1344,7 +1399,7 @@ fn decode_presence_payload(bytes: &[u8]) -> Result<PresenceRecord, DiscoveryErro
     Ok(PresenceRecord {
         network_id,
         epoch,
-        virtual_addr,
+        virtual_addrs,
         member_id,
         endpoint_id,
         candidates,
@@ -1450,6 +1505,7 @@ mod tests {
         signing: SigningKeypair,
         endpoint: EndpointId,
         address: ScopedVirtualAddr,
+        second_address: ScopedVirtualAddr,
     }
 
     fn fixture(seed: [[u8; 32]; 4]) -> Fixture {
@@ -1490,6 +1546,22 @@ mod tests {
         let address = ScopedVirtualAddr::Server {
             app: app.app_addr(),
         };
+        let second_app = AppRootKey::generate().unwrap();
+        let second_registration = AppRegistration::issue(&root, &second_app, 0);
+        let second_binding = AppBinding::issue(
+            &second_app,
+            network_id,
+            member.payload().member_id,
+            AppRole::Client,
+            Some(DeviceId::from_bytes([0x45; 32])),
+            20_000_000,
+            Vec::new(),
+        )
+        .unwrap();
+        let second_address = ScopedVirtualAddr::Client {
+            app: second_app.app_addr(),
+            device: DeviceId::from_bytes([0x45; 32]),
+        };
         let config = NetworkConfigV1 {
             network_id,
             epoch: 7,
@@ -1501,8 +1573,8 @@ mod tests {
             members: vec![member.to_bytes()],
             endpoint_bindings: vec![endpoint_binding.to_bytes()],
             revoked_serials: Vec::new(),
-            apps: vec![registration.to_bytes()],
-            app_bindings: vec![binding.to_bytes()],
+            apps: vec![registration.to_bytes(), second_registration.to_bytes()],
+            app_bindings: vec![binding.to_bytes(), second_binding.to_bytes()],
             virtual_dns: Vec::new(),
             relays: Vec::new(),
             presence_services: Vec::new(),
@@ -1516,6 +1588,7 @@ mod tests {
             signing,
             endpoint,
             address,
+            second_address,
         }
     }
 
@@ -1554,7 +1627,7 @@ mod tests {
             &fixture.config,
             &fixture.signing,
             fixture.endpoint,
-            fixture.address,
+            vec![fixture.address, fixture.second_address],
             candidates.clone(),
             0x05,
             9,
@@ -1570,7 +1643,10 @@ mod tests {
         let decoded = EncryptedPresenceRecord::from_bytes(&wire).unwrap();
         let opened = decoded.open(&fixture.config, 2_000).unwrap();
         assert_eq!(opened.endpoint_id, fixture.endpoint);
-        assert_eq!(opened.virtual_addr, fixture.address);
+        assert_eq!(
+            opened.virtual_addrs,
+            vec![fixture.address, fixture.second_address]
+        );
         assert_eq!(opened.candidates, candidates);
 
         let lookup = std::sync::Arc::new(WeaverAddressLookup::new(
@@ -1589,6 +1665,10 @@ mod tests {
         );
         assert_eq!(
             directory.resolve(fixture.address, 2_000),
+            Some(fixture.endpoint)
+        );
+        assert_eq!(
+            directory.resolve(fixture.second_address, 2_000),
             Some(fixture.endpoint)
         );
         directory.purge_expired(1_000 + DEFAULT_PRESENCE_TTL_MS);
@@ -1701,9 +1781,9 @@ mod tests {
         let record = PresenceRecord {
             network_id,
             epoch: 1,
-            virtual_addr: ScopedVirtualAddr::Server {
+            virtual_addrs: vec![ScopedVirtualAddr::Server {
                 app: AppAddr::from_bytes([0xb1; 32]),
-            },
+            }],
             member_id: MemberId::from_bytes([0xc1; 32]),
             endpoint_id: endpoint,
             candidates: vec![DiscoveryCandidate::Relay(
