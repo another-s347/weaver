@@ -36,6 +36,13 @@ pub struct NetworkHandleOpenOptions {
     pub allow_insecure_test_stores: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NetworkHandleTransportOptions {
+    /// Enables direct IP transports and protected LAN discovery candidates. Disabling this
+    /// forces all application and control-plane traffic through configured data relays.
+    pub disable_direct_paths: bool,
+}
+
 impl std::fmt::Debug for NetworkHandleOpenOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NetworkHandleOpenOptions")
@@ -81,6 +88,14 @@ impl NetworkHandle {
         options: NetworkHandleOpenOptions,
         bindings: impl IntoIterator<Item = LocalBinding>,
     ) -> Result<Self, NetworkHandleError> {
+        Self::open_with_transport_options(options, bindings, Default::default()).await
+    }
+
+    pub async fn open_with_transport_options(
+        options: NetworkHandleOpenOptions,
+        bindings: impl IntoIterator<Item = LocalBinding>,
+        transport: NetworkHandleTransportOptions,
+    ) -> Result<Self, NetworkHandleError> {
         validate_store_capabilities(&options)?;
         let bindings = LocalBindings::new(bindings)?;
         let network_id = options.root.network_id();
@@ -123,6 +138,7 @@ impl NetworkHandle {
         let lookup = Arc::new(WeaverAddressLookup::new(network_id));
 
         let mut node = NodeConfig::from_config(endpoint_secret, &config, bindings)?;
+        node.enable_direct_paths = !transport.disable_direct_paths;
         node = node
             .with_address_lookup(lookup.clone())
             .with_authorizer(authorizer.clone())
@@ -202,6 +218,11 @@ impl NetworkHandle {
         self.endpoint.local_bindings()
     }
 
+    /// Waits until this endpoint has registered with at least one configured data relay.
+    pub async fn wait_relay_online(&self, timeout: Duration) -> Result<(), NetworkHandleError> {
+        Ok(self.endpoint.wait_relay_online(timeout).await?)
+    }
+
     pub fn take_tcp_listener(
         &mut self,
         address: ServerAddr,
@@ -223,6 +244,7 @@ impl NetworkHandle {
     ) -> Result<VirtualTcpStream, NetworkHandleError> {
         let app = self.validate_server_target(target)?;
         let endpoint_id = self.resolve_configured_server(app)?;
+        let relay_url = self.authorizer.preferred_data_relay()?;
         Ok(self
             .endpoint
             .dialer()
@@ -232,7 +254,7 @@ impl NetworkHandle {
                     network_id: self.network_id,
                     app_addr: app,
                     endpoint_id,
-                    relay_url: None,
+                    relay_url,
                     direct_addresses: Vec::new(),
                 },
             )
@@ -265,6 +287,7 @@ impl NetworkHandle {
     ) -> Result<VirtualUdpSocket, NetworkHandleError> {
         let app = self.validate_server_target(target)?;
         let endpoint_id = self.resolve_configured_server(app)?;
+        let relay_url = self.authorizer.preferred_data_relay()?;
         Ok(self
             .endpoint
             .connect_udp(
@@ -273,7 +296,7 @@ impl NetworkHandle {
                     network_id: self.network_id,
                     app_addr: app,
                     endpoint_id,
-                    relay_url: None,
+                    relay_url,
                     direct_addresses: Vec::new(),
                 },
             )

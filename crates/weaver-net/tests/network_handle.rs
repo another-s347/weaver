@@ -1,18 +1,20 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use iroh::SecretKey;
+use iroh_relay::server::{RelayConfig, Server as RelayServer, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use weaver_config::{ConfigUpdateBatch, MemberEncryptionKeypair};
-use weaver_core::{ClientAddr, ServerAddr, VirtualAddr};
+use weaver_core::{ClientAddr, ServerAddr, VirtualAddr, VirtualName};
 use weaver_crypto::{
     AppBinding, AppRegistrationRequest, AppRole, AppRootKey, MemberRoles, PreparedJoinRequest,
     SigningKeypair, derive_device_id,
 };
 use weaver_net::{
     CONFIG_ENVELOPE_KEY, CONFIG_HEAD_KEY, CONFIG_SIGNER_CERTIFICATE_KEY, NetworkHandle,
-    NetworkHandleError, NetworkHandleOpenOptions, PersistedConfigState, decode_config_head,
-    encode_config_head, member_secret_id,
+    NetworkHandleError, NetworkHandleOpenOptions, NetworkHandleTransportOptions,
+    PersistedConfigState, TransportPathKind, decode_config_head, encode_config_head,
+    member_secret_id,
 };
 use weaver_relay_core::{Authority, AuthorityInit, JoinTicket};
 use weaver_store::{
@@ -305,6 +307,217 @@ async fn one_client_connects_multiple_cross_app_servers_on_a_zero_relay_lan() ->
     client.close().await;
     second_server.close().await;
     first_server.close().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cold_clients_connect_through_signed_data_relay_without_presence_or_lan() -> Result<()> {
+    let mut relay_config = ServerConfig::default();
+    relay_config.relay = Some(RelayConfig::new((Ipv4Addr::LOCALHOST, 0)));
+    let relay = RelayServer::spawn(relay_config).await?;
+    let relay_url = format!(
+        "http://{}",
+        relay.http_addr().context("relay missing HTTP listener")?
+    );
+
+    let now = now_ms();
+    let temp = tempfile::tempdir()?;
+    let authority_dir = temp.path().join("authority");
+    let initialized = Authority::initialize(AuthorityInit {
+        data_dir: authority_dir.clone(),
+        relay_url,
+        now_ms: now,
+        valid_for_ms: 60 * 60 * 1_000,
+        master_key: [0x91; 32],
+        recovery_root_out: None,
+    })
+    .await?;
+    let root = weaver_crypto::NetworkRootKey::from_bytes(&initialized.recovery_root_bytes());
+    let root_public = root.public();
+    let network_id = root_public.network_id();
+    let mut authority = Authority::open(authority_dir, [0x91; 32], now + 1).await?;
+
+    let mut server_member = invite_member(
+        &mut authority,
+        network_id,
+        MemberRoles::MEMBER.union(MemberRoles::SERVICE),
+        0x92,
+        now + 2,
+    )
+    .await?;
+    let mut first_client_member = invite_member(
+        &mut authority,
+        network_id,
+        MemberRoles::MEMBER,
+        0x93,
+        now + 3,
+    )
+    .await?;
+    let mut second_client_member = invite_member(
+        &mut authority,
+        network_id,
+        MemberRoles::MEMBER,
+        0x94,
+        now + 4,
+    )
+    .await?;
+
+    let app_root = AppRootKey::generate()?;
+    let app = app_root.app_addr();
+    authority
+        .register_app(
+            &AppRegistrationRequest::create(&app_root, network_id, 0),
+            now + 5,
+        )
+        .await?;
+    let server_certificate =
+        weaver_crypto::MemberCertificate::from_bytes(&server_member.ticket.member_certificate)?;
+    authority
+        .authorize_app_binding(
+            &AppBinding::issue(
+                &app_root,
+                network_id,
+                server_certificate.payload().member_id,
+                AppRole::Server,
+                None,
+                now + 30 * 60 * 1_000,
+                Vec::new(),
+            )?,
+            now + 6,
+        )
+        .await?;
+
+    let first_certificate = weaver_crypto::MemberCertificate::from_bytes(
+        &first_client_member.ticket.member_certificate,
+    )?;
+    let first_device =
+        derive_device_id(network_id, app, &first_client_member.signing.public_bytes());
+    authority
+        .authorize_app_binding(
+            &AppBinding::issue(
+                &app_root,
+                network_id,
+                first_certificate.payload().member_id,
+                AppRole::Client,
+                Some(first_device),
+                now + 30 * 60 * 1_000,
+                Vec::new(),
+            )?,
+            now + 7,
+        )
+        .await?;
+
+    let second_certificate = weaver_crypto::MemberCertificate::from_bytes(
+        &second_client_member.ticket.member_certificate,
+    )?;
+    let second_device = derive_device_id(
+        network_id,
+        app,
+        &second_client_member.signing.public_bytes(),
+    );
+    authority
+        .authorize_app_binding(
+            &AppBinding::issue(
+                &app_root,
+                network_id,
+                second_certificate.payload().member_id,
+                AppRole::Client,
+                Some(second_device),
+                now + 30 * 60 * 1_000,
+                Vec::new(),
+            )?,
+            now + 8,
+        )
+        .await?;
+    let name = VirtualName::new("cold-start.virtual")?;
+    authority
+        .set_virtual_dns(name.clone(), app, now + 30 * 60 * 1_000, now + 9)
+        .await?;
+
+    apply_authority_updates(&authority, &mut server_member, &root_public, now + 10).await?;
+    apply_authority_updates(&authority, &mut first_client_member, &root_public, now + 10).await?;
+    apply_authority_updates(
+        &authority,
+        &mut second_client_member,
+        &root_public,
+        now + 10,
+    )
+    .await?;
+
+    let relay_only = NetworkHandleTransportOptions {
+        disable_direct_paths: true,
+    };
+    let server_addr = ServerAddr::new(app);
+    let mut server = NetworkHandle::open_with_transport_options(
+        open_options(&server_member, root_public.clone()),
+        [weaver_net::LocalBinding::Server(server_addr)],
+        relay_only,
+    )
+    .await?;
+    server.wait_relay_online(Duration::from_secs(10)).await?;
+    let mut listener = server.take_tcp_listener(server_addr)?;
+
+    let first_source = ClientAddr::new(app, first_device);
+    let first_client = NetworkHandle::open_with_transport_options(
+        open_options(&first_client_member, root_public.clone()),
+        [weaver_net::LocalBinding::Client(first_source)],
+        relay_only,
+    )
+    .await?;
+    let second_source = ClientAddr::new(app, second_device);
+    let second_client = NetworkHandle::open_with_transport_options(
+        open_options(&second_client_member, root_public),
+        [weaver_net::LocalBinding::Client(second_source)],
+        relay_only,
+    )
+    .await?;
+    first_client
+        .wait_relay_online(Duration::from_secs(10))
+        .await?;
+    second_client
+        .wait_relay_online(Duration::from_secs(10))
+        .await?;
+
+    let server_task = tokio::spawn(async move {
+        let mut first = listener.accept().await?;
+        let mut second = listener.accept().await?;
+        tokio::try_join!(
+            async move {
+                let marker = first.read_u8().await?;
+                first.write_u8(marker).await
+            },
+            async move {
+                let marker = second.read_u8().await?;
+                second.write_u8(marker).await
+            },
+        )?;
+        Ok::<_, std::io::Error>(())
+    });
+    let (first_stream, second_stream) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::try_join!(
+            first_client.connect_tcp_name(first_source, &name),
+            second_client.connect_tcp_name(second_source, &name),
+        )
+    })
+    .await
+    .context("cold relay-only clients did not connect")??;
+
+    for mut stream in [first_stream, second_stream] {
+        assert!(
+            stream
+                .transport_paths()
+                .iter()
+                .any(|path| path.selected && path.kind == TransportPathKind::Relay)
+        );
+        stream.write_u8(0xa5).await?;
+        assert_eq!(stream.read_u8().await?, 0xa5);
+    }
+    server_task.await??;
+
+    second_client.close().await;
+    first_client.close().await;
+    server.close().await;
+    relay.shutdown().await?;
     Ok(())
 }
 

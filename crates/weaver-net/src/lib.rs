@@ -28,7 +28,8 @@ pub use membership::{
     MembershipStores, NetworkMembership,
 };
 pub use network_handle::{
-    NetworkHandle, NetworkHandleError, NetworkHandleOpenOptions, VirtualNetwork, member_secret_id,
+    NetworkHandle, NetworkHandleError, NetworkHandleOpenOptions, NetworkHandleTransportOptions,
+    VirtualNetwork, member_secret_id,
 };
 
 use std::{
@@ -1443,6 +1444,14 @@ impl LiveConfigAuthorizer {
             .expect("live config lock poisoned")
             .clone()
     }
+
+    pub(crate) fn preferred_data_relay(
+        &self,
+    ) -> Result<Option<RelayUrl>, ConfigAuthorizationError> {
+        Ok(configured_data_relay_urls(&self.config())?
+            .into_iter()
+            .next())
+    }
 }
 
 impl NetworkAuthorizer for LiveConfigAuthorizer {
@@ -1624,21 +1633,29 @@ impl ConfigAuthorizations {
                 });
             }
         }
-        let mut relay_urls = config
-            .relays
-            .iter()
-            .filter(|relay| relay.roles.contains(weaver_config::RelayRoles::DATA_RELAY))
-            .map(|relay| relay.url.parse())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ConfigAuthorizationError::MalformedRelayUrl)?;
-        relay_urls.sort_by_key(|left: &RelayUrl| left.to_string());
-        relay_urls.dedup();
+        let relay_urls = configured_data_relay_urls(validated)?;
         Ok(Self {
             relay_urls,
             allowed_clients,
             member_endpoints: endpoints_by_member.values().flatten().copied().collect(),
         })
     }
+}
+
+fn configured_data_relay_urls(
+    validated: &weaver_config::ValidatedNetworkConfig,
+) -> Result<Vec<RelayUrl>, ConfigAuthorizationError> {
+    let mut relay_urls = validated
+        .as_config()
+        .relays
+        .iter()
+        .filter(|relay| relay.roles.contains(weaver_config::RelayRoles::DATA_RELAY))
+        .map(|relay| relay.url.parse())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ConfigAuthorizationError::MalformedRelayUrl)?;
+    relay_urls.sort_by_key(|left: &RelayUrl| left.to_string());
+    relay_urls.dedup();
+    Ok(relay_urls)
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
