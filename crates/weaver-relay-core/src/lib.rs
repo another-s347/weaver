@@ -1,5 +1,12 @@
 //! Persistent authority state owned by the standalone Weaver relay.
 
+mod invitation;
+
+pub use invitation::{
+    BootstrapRedeemRequest, BootstrapRedeemResponse, BootstrapRejectCode, InvitationBundle,
+    bootstrap_alpn,
+};
+
 use std::{
     collections::HashSet,
     fmt,
@@ -969,6 +976,12 @@ pub enum AuthorityError {
     InvalidJoinRequest,
     #[error("join ticket is malformed, expired or does not match the prepared request")]
     InvalidJoinTicket,
+    #[error("invitation is malformed, expired, tampered, or belongs to another network")]
+    InvalidInvitation,
+    #[error("invitation was already redeemed by another prepared device")]
+    InvitationAlreadyUsed,
+    #[error("invitation was revoked or was never issued by this authority")]
+    InvitationRevoked,
     #[error("member does not exist in the current configuration")]
     MemberNotFound,
     #[error("the online authority cannot revoke the member holding its config decryption key")]

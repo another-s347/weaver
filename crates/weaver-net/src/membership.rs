@@ -1,6 +1,10 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use iroh::SecretKey;
+use futures_util::StreamExt;
+use iroh::{
+    Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey, TransportAddr, endpoint::presets,
+};
+use iroh_relay::{RelayConfig, RelayMap};
 use thiserror::Error;
 use weaver_config::{ChainExpectation, EncryptedConfigEnvelope, MemberEncryptionKeypair};
 use weaver_core::NetworkId;
@@ -8,7 +12,10 @@ use weaver_crypto::{
     AdminCertificate, MemberCertificate, MemberRoles, NetworkRootPublic, PreparedJoinRequest,
     SigningKeypair,
 };
-use weaver_relay_core::JoinTicket;
+use weaver_relay_core::{
+    BootstrapRedeemRequest, BootstrapRedeemResponse, BootstrapRejectCode, InvitationBundle,
+    JoinTicket, bootstrap_alpn,
+};
 use weaver_store::{
     AtomicBatch, ExpectedVersion, SecretBytes, SecretProtection, SecretStore, SecretStoreError,
     StateStore, StoreError, StoreKey, StoreScope,
@@ -33,6 +40,137 @@ pub struct MembershipStores {
 pub struct NetworkMembership;
 
 impl NetworkMembership {
+    /// Removes only Weaver membership/config state and member secrets for one network.
+    /// Application databases and authentication sessions are outside this namespace.
+    pub async fn reset(
+        stores: &MembershipStores,
+        network_id: NetworkId,
+    ) -> Result<(), MembershipError> {
+        validate_stores(stores)?;
+        let scope = StoreScope::member(network_id);
+        let mut entries = stores.state.scan_prefix(scope, b"").await?;
+        let mut batch = AtomicBatch::new(scope);
+        while let Some(entry) = entries.next().await {
+            let entry = entry?;
+            batch.delete(entry.key, ExpectedVersion::Exact(entry.value.version))?;
+        }
+        if !batch.is_empty() {
+            stores.state.commit(batch).await?;
+        }
+        for label in [
+            b"member-signing".as_slice(),
+            b"member-encryption",
+            b"endpoint",
+        ] {
+            match stores
+                .secrets
+                .delete(&member_secret_id(network_id, label))
+                .await
+            {
+                Ok(()) | Err(SecretStoreError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Redeems a signed one-time invitation over the restricted bootstrap ALPN and
+    /// atomically commits the returned membership. A retry reuses the same prepared
+    /// request and endpoint identity, allowing the authority to return the same ticket.
+    pub async fn redeem_invitation(
+        stores: &MembershipStores,
+        expected_root: &NetworkRootPublic,
+        invitation: &InvitationBundle,
+        now_ms: u64,
+        timeout: Duration,
+    ) -> Result<weaver_config::ConfigHead, MembershipError> {
+        validate_stores(stores)?;
+        invitation.verify(expected_root, now_ms)?;
+        if invitation.network_id != expected_root.network_id() {
+            return Err(MembershipError::BootstrapRejected(
+                BootstrapRejectCode::Invalid,
+            ));
+        }
+        let prepared = Self::prepare_join(
+            stores,
+            invitation.network_id,
+            MemberRoles::MEMBER,
+            invitation.expires_at_ms,
+        )
+        .await?;
+        let endpoint_secret = load_endpoint(stores, invitation.network_id).await?;
+        let relay_url = invitation
+            .bootstrap_relay
+            .as_deref()
+            .map(str::parse::<RelayUrl>)
+            .transpose()
+            .map_err(|error| MembershipError::Bootstrap(error.to_string()))?;
+        let relay_mode = match relay_url.clone() {
+            Some(url) => RelayMode::Custom(
+                std::iter::once(RelayConfig::new(url, None)).collect::<RelayMap>(),
+            ),
+            None => RelayMode::Disabled,
+        };
+        let endpoint = Endpoint::builder(presets::N0)
+            .clear_address_lookup()
+            .secret_key(endpoint_secret)
+            .relay_mode(relay_mode)
+            .bind()
+            .await
+            .map_err(|error| MembershipError::Bootstrap(error.to_string()))?;
+        let endpoint_id = iroh::EndpointId::from_bytes(&invitation.bootstrap_endpoint_id)
+            .map_err(|error| MembershipError::Bootstrap(error.to_string()))?;
+        let transports = invitation
+            .bootstrap_direct_addresses
+            .iter()
+            .copied()
+            .map(TransportAddr::Ip)
+            .chain(relay_url.map(TransportAddr::Relay));
+        let target = EndpointAddr::from_parts(endpoint_id, transports);
+        let request = BootstrapRedeemRequest {
+            invitation: invitation.clone(),
+            prepared,
+        }
+        .to_bytes()?;
+        let exchange = async {
+            let connection = endpoint
+                .connect(target, &bootstrap_alpn(invitation.network_id))
+                .await
+                .map_err(|error| MembershipError::Bootstrap(error.to_string()))?;
+            if connection.remote_id() != endpoint_id {
+                return Err(MembershipError::Bootstrap(
+                    "bootstrap endpoint identity mismatch".to_string(),
+                ));
+            }
+            let (mut send, mut recv) = connection
+                .open_bi()
+                .await
+                .map_err(|error| MembershipError::Bootstrap(error.to_string()))?;
+            send.write_all(&request)
+                .await
+                .map_err(|error| MembershipError::Bootstrap(error.to_string()))?;
+            send.finish()
+                .map_err(|error| MembershipError::Bootstrap(error.to_string()))?;
+            let response = recv
+                .read_to_end(1024 * 1024)
+                .await
+                .map_err(|error| MembershipError::Bootstrap(error.to_string()))?;
+            BootstrapRedeemResponse::from_bytes(&response).map_err(MembershipError::from)
+        };
+        let response = tokio::time::timeout(timeout, exchange)
+            .await
+            .map_err(|_| MembershipError::Bootstrap("bootstrap request timed out".to_string()))??;
+        endpoint.close().await;
+        match response {
+            BootstrapRedeemResponse::Accepted(ticket) => {
+                Self::join(stores, expected_root, &ticket, wall_now_ms()).await
+            }
+            BootstrapRedeemResponse::Rejected(code) => {
+                Err(MembershipError::BootstrapRejected(code))
+            }
+        }
+    }
+
     /// Creates or resumes a crash-safe join request. Secrets are persisted before the
     /// request references them, and a retry reconstructs the same member identities.
     pub async fn prepare_join(
@@ -176,6 +314,13 @@ impl NetworkMembership {
         stores.state.commit(batch).await?;
         Ok(opened.head)
     }
+}
+
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 async fn load_or_create_signing(
@@ -323,6 +468,10 @@ pub enum MembershipError {
     SecretMismatch(&'static str),
     #[error("ticket member certificate differs from the prepared request")]
     TicketMemberMismatch,
+    #[error("bootstrap transport failed: {0}")]
+    Bootstrap(String),
+    #[error("bootstrap authority rejected the invitation: {0:?}")]
+    BootstrapRejected(BootstrapRejectCode),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]

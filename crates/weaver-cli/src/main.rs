@@ -3,7 +3,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -19,7 +19,7 @@ use weaver_net::{
     ConfigPeerDescriptor, MembershipStores, NetworkMembership, NodeConfig, PersistedConfigState,
     WeaverEndpoint,
 };
-use weaver_relay_core::JoinTicket;
+use weaver_relay_core::{InvitationBundle, JoinTicket};
 use weaver_store::{
     AtomicBatch, EncryptedFileSecretStore, ExpectedVersion, RedbStateStore, SecretBytes, SecretId,
     SecretStore, StateStore, StoreKey, StoreScope,
@@ -41,6 +41,8 @@ enum Command {
     PrepareJoin(PrepareJoinArgs),
     /// Verify a .wjt ticket, decrypt its config and atomically join the network.
     Join(JoinArgs),
+    /// Redeem a one-time invitation through the restricted Bootstrap ALPN and join.
+    RedeemInvitation(RedeemInvitationArgs),
     /// Generate and persist an application root, then emit its signed registration request.
     AppPrepare(AppPrepareArgs),
     /// Sign a server or client application binding for this joined member.
@@ -91,6 +93,21 @@ struct JoinArgs {
 }
 
 #[derive(Debug, Args)]
+struct RedeemInvitationArgs {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    master_key_file: PathBuf,
+    #[arg(long)]
+    invitation: PathBuf,
+    /// Pinned hex-encoded network-root public key from the application environment.
+    #[arg(long)]
+    root_public_key: String,
+    #[arg(long, default_value_t = 15)]
+    timeout_seconds: u64,
+}
+
+#[derive(Debug, Args)]
 struct AppPrepareArgs {
     #[arg(long)]
     network_id: NetworkId,
@@ -100,6 +117,9 @@ struct AppPrepareArgs {
     master_key_file: PathBuf,
     #[arg(long)]
     out: PathBuf,
+    /// Optional create-new raw AppRootKey transfer file for authority enrollment install.
+    #[arg(long)]
+    enrollment_root_out: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     policy: u32,
 }
@@ -169,6 +189,7 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::PrepareJoin(args) => prepare_join(args).await,
         Command::Join(args) => join(args).await,
+        Command::RedeemInvitation(args) => redeem_invitation(args).await,
         Command::AppPrepare(args) => app_prepare(args).await,
         Command::AppBind(args) => app_bind(args).await,
         Command::ApplyUpdates(args) => apply_updates(args).await,
@@ -242,6 +263,35 @@ async fn join(args: JoinArgs) -> Result<()> {
     Ok(())
 }
 
+async fn redeem_invitation(args: RedeemInvitationArgs) -> Result<()> {
+    let root_bytes = decode_hex_32(&args.root_public_key)?;
+    let root = NetworkRootPublic::from_bytes(&root_bytes)?;
+    let invitation = InvitationBundle::from_text(&std::fs::read_to_string(&args.invitation)?)?;
+    let master_key = read_master_key(&args.master_key_file)?;
+    let stores = MembershipStores {
+        state: Arc::new(RedbStateStore::open(args.data_dir.join("state.redb"))?),
+        secrets: Arc::new(EncryptedFileSecretStore::open(
+            args.data_dir.join("secrets"),
+            *master_key,
+        )?),
+        allow_insecure_test_stores: false,
+    };
+    let head = NetworkMembership::redeem_invitation(
+        &stores,
+        &root,
+        &invitation,
+        now_ms()?,
+        Duration::from_secs(args.timeout_seconds),
+    )
+    .await?;
+    println!("network_id={}", invitation.network_id);
+    println!("client_app_addr={}", invitation.client_app_addr);
+    println!("service_name={}", invitation.service_name);
+    println!("revision={}", head.revision);
+    println!("epoch={}", head.epoch);
+    Ok(())
+}
+
 async fn app_prepare(args: AppPrepareArgs) -> Result<()> {
     let master_key = read_master_key(&args.master_key_file)?;
     let state = RedbStateStore::open(args.data_dir.join("state.redb"))?;
@@ -261,6 +311,10 @@ async fn app_prepare(args: AppPrepareArgs) -> Result<()> {
     batch.put(key, request.to_bytes(), ExpectedVersion::Missing)?;
     state.commit(batch).await?;
     write_new_file(&args.out, &request.to_bytes())?;
+    if let Some(path) = &args.enrollment_root_out {
+        write_new_file(path, &app_root.to_bytes())?;
+        println!("enrollment_root={}", path.display());
+    }
     println!("request={}", args.out.display());
     println!("app_addr={app_addr}");
     Ok(())

@@ -12,20 +12,27 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey as IrohSecretKey, endpoint::presets};
 use iroh_relay::server::{
     Access, AccessControl, CertConfig, ClientRateLimit, ClientRequest, RelayConfig, Server,
     ServerConfig, TlsConfig,
 };
+use iroh_relay::{RelayConfig as IrohRelayConfig, RelayMap};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use weaver_config::{ConfigHead, ConfigUpdateBatch, RelayRoles};
 use weaver_core::{AppAddr, MemberId, ScopedVirtualAddr, VirtualName};
-use weaver_crypto::{AppBinding, AppRegistrationRequest, MemberRoles, PreparedJoinRequest};
+use weaver_crypto::{
+    AppBinding, AppRegistrationRequest, AppRootKey, MemberRoles, PreparedJoinRequest,
+};
 use weaver_net::{
     ConfigUpdateSource, MemoryOpaquePresenceStore, NetworkAuthorizer, NodeConfig, WeaverEndpoint,
 };
-use weaver_relay_core::{Authority, AuthorityInit};
+use weaver_relay_core::{
+    Authority, AuthorityError, AuthorityInit, BootstrapRedeemRequest, BootstrapRedeemResponse,
+    BootstrapRejectCode, bootstrap_alpn,
+};
 use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
@@ -121,10 +128,16 @@ enum Command {
     Status(OpenArgs),
     /// Authorize a prepared node request and atomically commit its membership.
     Invite(InviteArgs),
+    /// Create a signed, single-use application enrollment invitation (24h by default).
+    InvitationCreate(InvitationCreateArgs),
+    /// Revoke an unused application enrollment invitation.
+    InvitationRevoke(InvitationRevokeArgs),
     /// Revoke a member, rotate the epoch and remove all of its app/endpoint bindings.
     Revoke(RevokeArgs),
     /// Register an application-owner signed virtual address request.
     AppRegister(AppRegisterArgs),
+    /// Install an encrypted online application root used only for client enrollment.
+    AppEnrollmentInstall(AppEnrollmentInstallArgs),
     /// Commit an application-owner signed server/client binding.
     AppBind(AppBindArgs),
     /// Add or update a readable name in the network's signed virtual DNS zone.
@@ -141,6 +154,8 @@ enum Command {
     Serve(ServeArgs),
     /// Create a private 32-byte master-key file for encrypted authority secrets.
     Keygen(KeygenArgs),
+    /// Create an Iroh endpoint key for the restricted bootstrap service.
+    BootstrapKeygen(KeygenArgs),
 }
 
 #[derive(Debug, ClapArgs)]
@@ -177,6 +192,12 @@ struct ServeArgs {
     data_dir: Option<PathBuf>,
     #[arg(long, requires = "data_dir")]
     master_key_file: Option<PathBuf>,
+    /// Iroh endpoint secret used by the restricted invitation bootstrap ALPN.
+    #[arg(long, requires_all = ["data_dir", "master_key_file"])]
+    bootstrap_key_file: Option<PathBuf>,
+    /// Optional dedicated relay for unjoined bootstrap endpoints. It carries no business ALPN.
+    #[arg(long, requires = "bootstrap_key_file")]
+    bootstrap_relay_listen: Option<SocketAddr>,
     /// HTTPS bind address. Production authority mode requires TLS unless explicitly overridden.
     #[arg(long, requires_all = ["tls_cert", "tls_key"])]
     https_listen: Option<SocketAddr>,
@@ -217,6 +238,41 @@ struct InviteArgs {
 }
 
 #[derive(Debug, ClapArgs)]
+struct InvitationCreateArgs {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    master_key_file: PathBuf,
+    #[arg(long)]
+    bootstrap_endpoint_id: iroh::EndpointId,
+    #[arg(long, value_delimiter = ',')]
+    bootstrap_direct: Vec<SocketAddr>,
+    #[arg(long)]
+    bootstrap_relay: Option<String>,
+    #[arg(long)]
+    client_app_addr: AppAddr,
+    #[arg(long, default_value = "remi.virtual")]
+    service_name: VirtualName,
+    #[arg(long, default_value_t = 24)]
+    valid_hours: u64,
+    #[arg(long)]
+    out: PathBuf,
+    /// Also render the invitation as an SVG QR code. Treat this file as a secret.
+    #[arg(long)]
+    qr_out: Option<PathBuf>,
+}
+
+#[derive(Debug, ClapArgs)]
+struct InvitationRevokeArgs {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    master_key_file: PathBuf,
+    #[arg(long)]
+    invitation_id: String,
+}
+
+#[derive(Debug, ClapArgs)]
 struct RevokeArgs {
     #[arg(long)]
     data_dir: PathBuf,
@@ -236,6 +292,17 @@ struct AppRegisterArgs {
     request: PathBuf,
     #[arg(long)]
     out: PathBuf,
+}
+
+#[derive(Debug, ClapArgs)]
+struct AppEnrollmentInstallArgs {
+    #[arg(long)]
+    data_dir: PathBuf,
+    #[arg(long)]
+    master_key_file: PathBuf,
+    /// Raw 32-byte AppRootKey transfer file. Delete it after successful installation.
+    #[arg(long)]
+    app_root_key_file: PathBuf,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -354,8 +421,11 @@ async fn main() -> Result<()> {
         Some(Command::Init(args)) => init(args).await,
         Some(Command::Status(args)) => status(args).await,
         Some(Command::Invite(args)) => invite(args).await,
+        Some(Command::InvitationCreate(args)) => invitation_create(args).await,
+        Some(Command::InvitationRevoke(args)) => invitation_revoke(args).await,
         Some(Command::Revoke(args)) => revoke(args).await,
         Some(Command::AppRegister(args)) => app_register(args).await,
+        Some(Command::AppEnrollmentInstall(args)) => app_enrollment_install(args).await,
         Some(Command::AppBind(args)) => app_bind(args).await,
         Some(Command::DnsSet(args)) => dns_set(args).await,
         Some(Command::DnsRemove(args)) => dns_remove(args).await,
@@ -364,12 +434,15 @@ async fn main() -> Result<()> {
         Some(Command::ExportUpdates(args)) => export_updates(args).await,
         Some(Command::Serve(args)) => serve(args).await,
         Some(Command::Keygen(args)) => keygen(args),
+        Some(Command::BootstrapKeygen(args)) => bootstrap_keygen(args),
         None => {
             serve(ServeArgs {
                 role: ServeRole::Auto,
                 listen: cli.listen,
                 data_dir: None,
                 master_key_file: None,
+                bootstrap_key_file: None,
+                bootstrap_relay_listen: None,
                 https_listen: None,
                 tls_cert: None,
                 tls_key: None,
@@ -452,6 +525,61 @@ async fn invite(args: InviteArgs) -> Result<()> {
     Ok(())
 }
 
+async fn invitation_create(args: InvitationCreateArgs) -> Result<()> {
+    let master_key = read_master_key(&args.master_key_file)?;
+    let authority = Authority::open(args.data_dir, *master_key, now_ms()?)
+        .await
+        .context("failed to open Weaver authority")?;
+    let valid_for_ms = args
+        .valid_hours
+        .checked_mul(60 * 60 * 1_000)
+        .context("--valid-hours is too large")?;
+    let invitation = authority
+        .create_invitation(
+            args.bootstrap_endpoint_id,
+            args.bootstrap_direct,
+            args.bootstrap_relay,
+            args.client_app_addr,
+            args.service_name,
+            now_ms()?,
+            valid_for_ms,
+        )
+        .await
+        .context("failed to create invitation")?;
+    let invitation_text = invitation.to_text();
+    write_new_file(&args.out, invitation_text.as_bytes())?;
+    if let Some(path) = &args.qr_out {
+        let code = qrcode::QrCode::new(invitation_text.as_bytes())
+            .context("invitation is too large to encode as a QR code")?;
+        let svg = code
+            .render::<qrcode::render::svg::Color>()
+            .min_dimensions(512, 512)
+            .quiet_zone(true)
+            .build();
+        write_new_file(path, svg.as_bytes())?;
+        println!("invitation_qr={}", path.display());
+    }
+    println!("invitation={}", args.out.display());
+    println!("invitation_id={}", hex::encode(invitation.invitation_id));
+    println!("network_id={}", invitation.network_id);
+    println!("expires_at_ms={}", invitation.expires_at_ms);
+    Ok(())
+}
+
+async fn invitation_revoke(args: InvitationRevokeArgs) -> Result<()> {
+    let master_key = read_master_key(&args.master_key_file)?;
+    let authority = Authority::open(args.data_dir, *master_key, now_ms()?)
+        .await
+        .context("failed to open Weaver authority")?;
+    let invitation_id: [u8; 32] = decode_hex_32(&args.invitation_id)?;
+    authority
+        .revoke_invitation(invitation_id)
+        .await
+        .context("failed to revoke invitation")?;
+    println!("revoked_invitation_id={}", args.invitation_id);
+    Ok(())
+}
+
 async fn revoke(args: RevokeArgs) -> Result<()> {
     let master_key = read_master_key(&args.master_key_file)?;
     let mut authority = Authority::open(args.data_dir, *master_key, now_ms()?)
@@ -475,6 +603,29 @@ async fn app_register(args: AppRegisterArgs) -> Result<()> {
     write_new_file(&args.out, &registered.registration)?;
     println!("registration={}", args.out.display());
     println!("revision={}", registered.status.head.revision);
+    Ok(())
+}
+
+async fn app_enrollment_install(args: AppEnrollmentInstallArgs) -> Result<()> {
+    let master_key = read_master_key(&args.master_key_file)?;
+    let authority = Authority::open(args.data_dir, *master_key, now_ms()?)
+        .await
+        .context("failed to open Weaver authority")?;
+    let raw = Zeroizing::new(
+        std::fs::read(&args.app_root_key_file)
+            .with_context(|| format!("failed to read {}", args.app_root_key_file.display()))?,
+    );
+    let bytes: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("application root key must contain exactly 32 raw bytes"))?;
+    let app_root = AppRootKey::from_bytes(&bytes);
+    authority
+        .install_enrollment_app_root(&app_root)
+        .await
+        .context("failed to install enrollment application root")?;
+    println!("client_app_addr={}", app_root.app_addr());
+    println!("enrollment_key=installed");
     Ok(())
 }
 
@@ -683,6 +834,41 @@ async fn serve(args: ServeArgs) -> Result<()> {
         None
     };
 
+    // Bootstrap relay is deliberately separate from the member-only data relay. It may
+    // carry QUIC for unjoined endpoint identities, while the destination endpoint exposes
+    // only the invitation redemption ALPN.
+    let bootstrap_relay = if let Some(listen) = args.bootstrap_relay_listen {
+        let mut config = ServerConfig::default();
+        config.relay = Some(RelayConfig::new(listen));
+        let relay = Server::spawn(config)
+            .await
+            .context("failed to start bootstrap relay")?;
+        let listen = relay
+            .http_addr()
+            .context("bootstrap relay did not bind HTTP")?;
+        println!("bootstrap_relay_url=http://{listen}");
+        Some(relay)
+    } else {
+        None
+    };
+
+    let bootstrap_endpoint = if let Some(key_file) = args.bootstrap_key_file.as_ref() {
+        let authority = authority
+            .as_ref()
+            .context("--bootstrap-key-file requires authority state")?
+            .clone();
+        let secret = read_endpoint_key(key_file)?;
+        let relay_url = bootstrap_relay
+            .as_ref()
+            .and_then(|relay| relay.http_addr())
+            .map(|address| format!("http://{address}").parse())
+            .transpose()
+            .context("bootstrap relay URL is invalid")?;
+        Some(start_bootstrap_endpoint(authority, allowed_members.clone(), secret, relay_url).await?)
+    } else {
+        None
+    };
+
     let config_endpoint = if runs_authority {
         let authority = authority
             .as_ref()
@@ -769,6 +955,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
     if let Some(endpoint) = config_endpoint {
         endpoint.close().await;
     }
+    if let Some((endpoint, task)) = bootstrap_endpoint {
+        endpoint.close().await;
+        task.abort();
+        let _ = task.await;
+    }
     if let Some(task) = reload_task {
         task.abort();
         let _ = task.await;
@@ -776,7 +967,143 @@ async fn serve(args: ServeArgs) -> Result<()> {
     if let Some(server) = server {
         server.shutdown().await.context("relay shutdown failed")?;
     }
+    if let Some(server) = bootstrap_relay {
+        server
+            .shutdown()
+            .await
+            .context("bootstrap relay shutdown failed")?;
+    }
     Ok(())
+}
+
+async fn start_bootstrap_endpoint(
+    authority: Arc<tokio::sync::RwLock<Authority>>,
+    allowed_members: Arc<std::sync::RwLock<HashSet<iroh::EndpointId>>>,
+    secret: IrohSecretKey,
+    relay_url: Option<RelayUrl>,
+) -> Result<(Endpoint, tokio::task::JoinHandle<()>)> {
+    let network_id = authority.read().await.status().network_id;
+    let relay_mode = match relay_url.clone() {
+        Some(url) => RelayMode::Custom(
+            std::iter::once(IrohRelayConfig::new(url, None)).collect::<RelayMap>(),
+        ),
+        None => RelayMode::Disabled,
+    };
+    let endpoint = Endpoint::builder(presets::N0)
+        .clear_address_lookup()
+        .secret_key(secret)
+        .alpns(vec![bootstrap_alpn(network_id)])
+        .relay_mode(relay_mode)
+        .bind()
+        .await
+        .context("failed to bind bootstrap endpoint")?;
+    if relay_url.is_some() {
+        tokio::time::timeout(Duration::from_secs(10), endpoint.online())
+            .await
+            .context("bootstrap endpoint did not reach bootstrap relay")?;
+    }
+    println!("bootstrap_endpoint_id={}", endpoint.id());
+    for address in endpoint.addr().ip_addrs() {
+        println!("bootstrap_direct={address}");
+    }
+    let accept_endpoint = endpoint.clone();
+    let task = tokio::spawn(async move {
+        while let Some(incoming) = accept_endpoint.accept().await {
+            let authority = authority.clone();
+            let allowed_members = allowed_members.clone();
+            tokio::spawn(async move {
+                let mut accepting = match incoming.accept() {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let alpn =
+                    match tokio::time::timeout(Duration::from_secs(10), accepting.alpn()).await {
+                        Ok(Ok(value)) => value,
+                        _ => return,
+                    };
+                if alpn != bootstrap_alpn(network_id) {
+                    return;
+                }
+                let connection =
+                    match tokio::time::timeout(Duration::from_secs(10), accepting).await {
+                        Ok(Ok(value)) => value,
+                        _ => return,
+                    };
+                let remote_id = connection.remote_id();
+                let (mut send, mut recv) = match connection.accept_bi().await {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let response = match recv.read_to_end(1024 * 1024).await {
+                    Ok(bytes) => match BootstrapRedeemRequest::from_bytes(&bytes) {
+                        Ok(request)
+                            if request.prepared.request.payload().endpoint_id
+                                == *remote_id.as_bytes() =>
+                        {
+                            let result = authority
+                                .write()
+                                .await
+                                .redeem_invitation_online(
+                                    &request.invitation,
+                                    &request.prepared,
+                                    now_ms().unwrap_or(0),
+                                )
+                                .await;
+                            match result {
+                                Ok(ticket) => {
+                                    if let Ok(next_allowed) =
+                                        authority.read().await.allowed_member_endpoints()
+                                    {
+                                        *allowed_members
+                                            .write()
+                                            .expect("relay access lock poisoned") = next_allowed;
+                                    }
+                                    BootstrapRedeemResponse::Accepted(ticket)
+                                }
+                                Err(error) => {
+                                    BootstrapRedeemResponse::Rejected(bootstrap_reject_code(&error))
+                                }
+                            }
+                        }
+                        _ => BootstrapRedeemResponse::Rejected(BootstrapRejectCode::Invalid),
+                    },
+                    Err(_) => BootstrapRedeemResponse::Rejected(BootstrapRejectCode::Invalid),
+                };
+                if let Ok(bytes) = response.to_bytes() {
+                    if send.write_all(&bytes).await.is_ok() {
+                        let _ = send.finish();
+                        let _ = send.stopped().await;
+                    }
+                }
+            });
+        }
+    });
+    Ok((endpoint, task))
+}
+
+fn bootstrap_reject_code(error: &AuthorityError) -> BootstrapRejectCode {
+    match error {
+        AuthorityError::InvitationAlreadyUsed => BootstrapRejectCode::AlreadyUsed,
+        AuthorityError::InvitationRevoked => BootstrapRejectCode::Revoked,
+        AuthorityError::InvalidInvitation
+        | AuthorityError::InvalidJoinRequest
+        | AuthorityError::InvalidJoinTicket
+        | AuthorityError::Crypto(_)
+        | AuthorityError::ApplicationNotFound => BootstrapRejectCode::Invalid,
+        _ => BootstrapRejectCode::Internal,
+    }
+}
+
+fn read_endpoint_key(path: &Path) -> Result<IrohSecretKey> {
+    let bytes = Zeroizing::new(
+        std::fs::read(path)
+            .with_context(|| format!("failed to read endpoint key file {}", path.display()))?,
+    );
+    let key: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("endpoint key file must contain exactly 32 raw bytes"))?;
+    Ok(IrohSecretKey::from_bytes(&key))
 }
 
 fn load_tls_server_config(cert_path: &Path, key_path: &Path) -> Result<rustls::ServerConfig> {
@@ -832,6 +1159,24 @@ fn keygen(args: KeygenArgs) -> Result<()> {
         File::open(parent)?.sync_all()?;
     }
     println!("master_key_file={}", args.out.display());
+    Ok(())
+}
+
+fn bootstrap_keygen(args: KeygenArgs) -> Result<()> {
+    let secret = IrohSecretKey::generate();
+    let mut file = private_new_file(&args.out).with_context(|| {
+        format!(
+            "refusing to replace endpoint key file {}",
+            args.out.display()
+        )
+    })?;
+    file.write_all(&secret.to_bytes())?;
+    file.sync_all()?;
+    if let Some(parent) = args.out.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    println!("bootstrap_key_file={}", args.out.display());
+    println!("bootstrap_endpoint_id={}", secret.public());
     Ok(())
 }
 

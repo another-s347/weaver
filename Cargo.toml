@@ -27,6 +27,7 @@ axum = { version = "0.8", features = ["ws"] }
 aes-gcm = "0.10"
 async-stream = "0.3"
 async-trait = "0.1"
+base64 = "0.22"
 blake3 = "1"
 bytes = "1"
 chacha20poly1305 = "=0.11.0"
@@ -45,6 +46,7 @@ iroh-relay = { version = "=1.0.3", default-features = false, features = ["server
 n0-future = "=0.3.2"
 netdev = "=0.45.0"
 prost = "0.14"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 redb = "=4.2.0"
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = { version = "=1.15.1", features = ["std"] }
